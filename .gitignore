@@ -1,0 +1,49 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# Output and cache directories
+output/*
+cache/*
+logs/*
+input/*
+
+# Models
+models/*
+models/whisper/base.pt
+models/yolov8n.pt
+yolov8n.pt
+
+# Build and distribution
+bin/*
+lib/*
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/settings.json
+.github/*
+
+# Test and debug files
+test_*.py
+debug_*.py
+test_object_detection.log
+
+# Documentation (generated/temporary)
+docs/*
+IMPROVEMENTS.md
+AI_TITLE_GENERATION_SUMMARY.md
+SUBTITLE_OVERLAY_USAGE.md
+
+# Legacy project
+video-shorts-pipeline/*

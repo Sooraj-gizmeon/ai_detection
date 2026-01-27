@@ -1,0 +1,77 @@
+# Docker ignore file to reduce build context size
+
+# Cache directories
+cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Model files (these are large)
+models/
+*.pt
+*.pth
+*.ckpt
+
+# Video files 
+input/
+output/
+temp/
+
+# Backup files
+backups/
+
+# Log files
+logs/
+*.log
+
+# Git files
+.git/
+.gitignore
+
+# Test files
+test_*.py
+*_test.py
+
+# Documentation
+docs/
+*.md
+README.md
+
+# Development files
+.vscode/
+.idea/
+
+# Temporary files
+tmp/
+temp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python virtual environments
+venv/
+env/
+video-shorts-pipeline/
+
+# Database files
+*.db
+*.sqlite
+
+# Jupyter notebooks
+*.ipynb
+
+# IDE files
+*.swp
+*.swo
+
+# Large data files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wav
+*.mp3
+
+# Tracking cache
+tracking_cache/

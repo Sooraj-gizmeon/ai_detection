@@ -1,0 +1,1814 @@
+# src/ai_integration/ollama_client.py
+"""Ollama API client for content analysis and decision making"""
+
+import aiohttp
+import asyncio
+import json
+import logging
+from typing import Dict, List, Optional, Any
+import time
+from pathlib import Path
+from ..utils.cache_manager import CacheManager
+from config.smart_zoom_settings import OLLAMA_CONFIG
+from config.ollama_prompts import (
+    ZOOM_ANALYSIS_PROMPTS, CONTENT_ANALYSIS_PROMPTS,
+    FAST_ZOOM_ANALYSIS_PROMPTS, FAST_CONTENT_ANALYSIS_PROMPTS
+)
+
+
+class OllamaClient:
+    """
+    Ollama API client for AI-powered content analysis and zoom decision making.
+    """
+    
+    def __init__(self, 
+                 base_url: str = None,
+                 bearer_token: str = None,
+                 timeout: int = None,  # Will use config default if None
+                 max_retries: int = None,  # Will use config default if None
+                 cache_dir: str = "cache"):
+        """
+        Initialize Ollama client.
+        
+        Args:
+            base_url: Base URL for Ollama API
+            bearer_token: Bearer token for authentication
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
+            cache_dir: Directory for caching responses
+        """
+        import os
+        from dotenv import load_dotenv
+        
+        # Load environment variables
+        load_dotenv()
+        
+        self.base_url = (base_url or os.getenv('OLLAMA_BASE_URL') or OLLAMA_CONFIG['base_url']).rstrip('/')
+        # self.bearer_token = bearer_token or os.getenv('OLLAMA_BEARER_TOKEN')
+        self.bearer_token = None  # Disable authentication
+        
+        # Get settings from configuration
+        self.timeout = timeout or OLLAMA_CONFIG.get('timeout', 30)
+        self.max_retries = max_retries or OLLAMA_CONFIG.get('max_retries', 3)
+        self.retry_delay = OLLAMA_CONFIG.get('retry_delay', 1)
+        
+        # Feature flags
+        self.fast_mode = OLLAMA_CONFIG.get('fast_mode', True)
+        self.skip_on_error = OLLAMA_CONFIG.get('skip_on_error', True)
+        
+        # Request settings
+        self.request_settings = OLLAMA_CONFIG.get('request_settings', {
+            "temperature": 0.1,
+            "num_predict": 768,
+            "num_ctx": 4096,
+            "keep_alive": "20m",
+        })
+        
+        # Streaming settings
+        self.streaming_settings = OLLAMA_CONFIG.get('streaming', {
+            "enabled": True,
+            "large_request_threshold": 5000,
+            "very_large_threshold": 15000,
+            "max_streaming_timeout": 180.0,
+        })
+        
+        # Connection settings
+        self.connection_settings = OLLAMA_CONFIG.get('connection_settings', {
+            "connection_limit": 20,
+            "connection_limit_per_host": 10,
+            "keepalive_timeout": 60.0,
+        })
+        
+        # Performance settings
+        self.performance_settings = OLLAMA_CONFIG.get('performance', {
+            "batch_processing": True,
+            "batch_size": 5,
+            "preload_models": True,
+            "adaptive_timeouts": True,
+        })
+        
+        # Initialize cache manager
+        self.cache_manager = CacheManager(cache_dir)
+        
+        # Setup logging
+        self.logger = logging.getLogger(__name__)
+        
+        # Session for connection pooling
+        self.session = None
+        
+        # Request statistics
+        self.stats = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'cache_hits': 0,
+            'total_response_time': 0.0
+        }
+        
+        self.logger.info(f"OllamaClient initialized with base URL: {self.base_url}")
+        if self.bearer_token:
+            self.logger.info(f"Bearer token loaded: {self.bearer_token[:10]}...{self.bearer_token[-5:]}")
+        else:
+            self.logger.warning("No bearer token found - authentication may fail")
+        
+        # Store available models (will be populated on first use)
+        self._available_models = []
+        self._vision_models = []
+        self._models_fetched = False
+    
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self._create_session()
+        
+        # Preload models if enabled in config
+        if self.performance_settings.get("preload_models", False):
+            self.logger.info("Preloading models on startup as configured")
+            try:
+                # First fetch available models
+                await self._fetch_models()
+                
+                # Then preload the models we'll use
+                for model_type, model_name in OLLAMA_CONFIG.get('models', {}).items():
+                    if model_name:
+                        await self.preload_model(model_name)
+            except Exception as e:
+                self.logger.warning(f"Error preloading models: {str(e)}")
+        
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self._close_session()
+    
+    async def _create_session(self):
+        """Create HTTP session with proper configuration."""
+        # Basic headers - authorization will be added per request
+        headers = {
+            'User-Agent': 'VideoToShorts/1.0',
+            'Accept': 'application/json'
+        }
+        
+        # Use a longer timeout for the client session but shorter timeouts for individual requests
+        # This prevents hanging sessions while allowing flexibility per request
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=10.0,        # 10 seconds to establish connection
+            sock_connect=10.0,   # 10 seconds for socket connection
+            sock_read=30.0       # 30 seconds to read socket data
+        )
+        
+        # Get connection settings from config
+        connection_limit = self.connection_settings.get("connection_limit", 20)
+        connection_limit_per_host = self.connection_settings.get("connection_limit_per_host", 10)
+        keepalive_timeout = self.connection_settings.get("keepalive_timeout", 60.0)
+        
+        # Optimize connection pooling for multiple parallel requests
+        self.session = aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout,
+            connector=aiohttp.TCPConnector(
+                limit=connection_limit,                 # Configurable concurrent connections
+                limit_per_host=connection_limit_per_host,  # Configurable per-host limit
+                keepalive_timeout=keepalive_timeout,   # Configurable keep-alive
+                force_close=False,        # Don't force close connections
+                enable_cleanup_closed=True # Clean up closed connections
+            )
+        )
+    
+    async def _close_session(self):
+        """Close HTTP session."""
+        if self.session:
+            await self.session.close()
+            self.session = None
+    
+    async def get_available_models(self) -> List[Dict]:
+        """
+        Get list of available models from Ollama API.
+        
+        Returns:
+            List of available models with metadata
+        """
+        if not self._models_fetched:
+            await self._fetch_models()
+        return self._available_models
+    
+    async def _fetch_models(self):
+        """Fetch available models from API."""
+        try:
+            if not self.session:
+                await self._create_session()
+            
+            # Prepare headers with authentication
+            # headers = {
+            #     "Authorization": f"Bearer {self.bearer_token}"
+            # } if self.bearer_token else {}
+            headers = {}  # No auth
+            
+            # Use the correct URL format
+            url = f"{self.base_url}/api/tags"
+            self.logger.info(f"Fetching models from: {url}")
+            
+            async with self.session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self._available_models = data.get('models', [])
+                    
+                    # Detect vision-capable models (basic heuristic)
+                    self._vision_models = [
+                        model for model in self._available_models
+                        if any(keyword in model['name'].lower() 
+                               for keyword in ['vision', 'multimodal', 'llava', 'bakllava'])
+                    ]
+                    
+                    self._models_fetched = True
+                    self.logger.info(f"Found {len(self._available_models)} available models")
+                    if self._available_models:
+                        model_names = [m.get('name', 'Unknown') for m in self._available_models]
+                        self.logger.info(f"Available models: {model_names}")
+                    if self._vision_models:
+                        vision_names = [m.get('name', 'Unknown') for m in self._vision_models]
+                        self.logger.info(f"Vision models: {vision_names}")
+                elif response.status == 401:
+                    error_text = await response.text()
+                    self.logger.error(f"Authentication failed - check bearer token. Status: {response.status}, Response: {error_text}")
+                else:
+                    error_text = await response.text()
+                    self.logger.error(f"Failed to fetch models: {response.status}, Response: {error_text}")
+        except Exception as e:
+            self.logger.error(f"Error fetching models: {e}")
+    
+    async def _handle_streaming_response(self, response):
+        """
+        Handle a streaming response from the API with robust error handling.
+        
+        Args:
+            response: aiohttp response object
+            
+        Returns:
+            Async generator yielding parsed JSON chunks
+        """
+        buffer = ""
+        
+        try:
+            async for chunk in response.content.iter_any():
+                if not chunk:
+                    continue
+                    
+                chunk_str = chunk.decode('utf-8')
+                buffer += chunk_str
+                
+                # Try to extract complete JSON objects from the buffer
+                while True:
+                    # Look for JSON delimiters
+                    json_start = buffer.find('{')
+                    if json_start == -1:
+                        break
+                        
+                    # Find matching closing brace with proper nesting
+                    brace_count = 0
+                    in_string = False
+                    escape_next = False
+                    json_end = -1
+                    
+                    for i in range(json_start, len(buffer)):
+                        char = buffer[i]
+                        
+                        # Handle string literals
+                        if char == '\\' and not escape_next:
+                            escape_next = True
+                            continue
+                            
+                        if char == '"' and not escape_next:
+                            in_string = not in_string
+                            
+                        escape_next = False
+                        
+                        if not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                                
+                            # Found matching closing brace
+                            if brace_count == 0:
+                                json_end = i + 1
+                                break
+                                
+                    if json_end == -1:
+                        # No complete JSON object found yet
+                        break
+                        
+                    # Extract and parse complete JSON object
+                    json_str = buffer[json_start:json_end]
+                    buffer = buffer[json_end:]
+                    
+                    try:
+                        json_obj = json.loads(json_str)
+                        yield json_obj
+                    except json.JSONDecodeError as e:
+                        self.logger.warning(f"Failed to parse streaming JSON chunk: {e}")
+                        # Continue to next chunk
+            
+            # Process any remaining data in buffer
+            if buffer.strip():
+                try:
+                    # Try to extract any valid JSON from the remaining buffer
+                    json_start = buffer.find('{')
+                    json_end = buffer.rfind('}') + 1
+                    
+                    if json_start != -1 and json_end > json_start:
+                        json_str = buffer[json_start:json_end]
+                        json_obj = json.loads(json_str)
+                        yield json_obj
+                except json.JSONDecodeError:
+                    self.logger.warning(f"Failed to parse final JSON chunk from buffer")
+                    
+        except Exception as e:
+            self.logger.error(f"Error processing streaming response: {str(e)}")
+            # Yield an error object
+            yield {
+                "error": f"Streaming error: {str(e)}",
+                "status": "stream_error"
+            }
+    
+    def get_best_model(self, task_type: str = "text") -> str:
+        """
+        Get the best model for a specific task type.
+        
+        Args:
+            task_type: Type of task ('text', 'vision', 'analysis')
+            
+        Returns:
+            Best model name for the task
+        """
+        # Check if we have a configured model for this task type
+        configured_models = OLLAMA_CONFIG.get('models', {})
+        if task_type in configured_models and configured_models[task_type]:
+            return configured_models[task_type]
+        
+        # If no configured model, select based on available models
+        if not self._models_fetched:
+            # Return default model if models haven't been fetched
+            return "mistral-small3.2:latest"
+        
+        if task_type == "vision" and self._vision_models:
+            return self._vision_models[0]['name']
+        elif task_type == "analysis" and self._available_models:
+            # Prefer larger models for analysis
+            large_models = [m for m in self._available_models if 'large' in m['name'].lower()]
+            if large_models:
+                return large_models[0]['name']
+        
+        # Default to the first available model
+        if self._available_models:
+            return self._available_models[0]['name']
+        
+        return "mistral-small3.2:latest"
+    
+    async def analyze_framing_strategy(self, transcription: Dict) -> Dict:
+        """
+        Analyze transcript to determine optimal framing strategies.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Framing strategy recommendations
+        """
+        # Choose prompt based on fast mode setting
+        prompts = FAST_ZOOM_ANALYSIS_PROMPTS if self.fast_mode else ZOOM_ANALYSIS_PROMPTS
+        prompt = prompts['framing_strategy'].format(
+            transcription=json.dumps(transcription, indent=2)
+        )
+        
+        # Check if this is a large request that may benefit from streaming
+        transcription_size = len(json.dumps(transcription))
+        large_threshold = self.streaming_settings.get("large_request_threshold", 5000)
+        streaming_enabled = self.streaming_settings.get("enabled", True)
+        
+        if streaming_enabled and transcription_size > large_threshold:
+            self.logger.info(f"Using streaming for large framing strategy analysis ({transcription_size} chars)")
+            response = await self._make_streamed_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"framing_strategy_{hash(str(transcription))}"
+            )
+        else:
+            response = await self._make_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"framing_strategy_{hash(str(transcription))}"
+            )
+        
+        return self._parse_json_response(response)
+    
+    async def _make_streamed_request(self, 
+                                prompt: str,
+                                model: str = "mistral-small3.2:latest",
+                                cache_key: str = None,
+                                images: List[str] = None) -> str:
+        """
+        Make a streaming request to Ollama API for large prompts, collecting results incrementally.
+        
+        Args:
+            prompt: Prompt to send
+            model: Model to use
+            cache_key: Cache key for response caching
+            images: List of base64 encoded images for vision models
+            
+        Returns:
+            Concatenated API response text
+        """
+        # Check cache first
+        if cache_key:
+            cached_response = self.cache_manager.get_cached_result(cache_key)
+            if cached_response:
+                self.stats['cache_hits'] += 1
+                return cached_response
+        
+        # Create session if not exists
+        if not self.session:
+            await self._create_session()
+        
+        # Fetch models if not already done
+        if not self._models_fetched:
+            await self._fetch_models()
+        
+        # Get parameters from configuration
+        temperature = self.request_settings.get("temperature", 0.1)
+        num_predict = int(self.request_settings.get("num_predict", 768) * 1.5)  # Higher limit for streaming
+        ctx_size = int(self.request_settings.get("num_ctx", 4096) * 1.5)        # Larger context for streaming
+        keep_alive = self.request_settings.get("keep_alive", "20m")
+        
+        # Prepare request data optimized for streaming
+        request_data = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "stream": True,  # Enable streaming
+            "options": {
+                "temperature": temperature,
+                "top_p": 0.9,
+                "num_predict": num_predict,  # Higher token limit for streaming
+                "num_ctx": ctx_size,         # Larger context window
+                "keep_alive": keep_alive,    # Keep model in memory longer
+                "top_k": 40
+            },
+            "format": "json"  # Simplified format specification for streaming
+        }
+        
+        # Add images for vision requests
+        if images:
+            request_data["messages"][0]["images"] = images
+        
+        # Prepare headers
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+            # "Authorization": f"Bearer {self.bearer_token}"
+        }
+        
+        # Use longer timeout for streaming requests
+        max_streaming_timeout = self.streaming_settings.get("max_streaming_timeout", 180.0)
+        request_timeout = min(self.timeout * 2, max_streaming_timeout)  # Up to 2x default but max configured limit
+        
+        # Make request with retries
+        for attempt in range(self.max_retries + 1):
+            try:
+                start_time = time.time()
+                self.stats['total_requests'] += 1
+                
+                # Use the correct URL format
+                url = f"{self.base_url}/api/chat"
+                self.logger.info(f"Making streamed request to {url} (attempt {attempt + 1}/{self.max_retries + 1})")
+                
+                # Create custom timeout
+                timeout = aiohttp.ClientTimeout(total=request_timeout)
+                
+                async with self.session.post(
+                    url,
+                    headers=headers,
+                    json=request_data,
+                    timeout=timeout
+                ) as response:
+                    if response.status == 200:
+                        # Collect all chunks into a buffer
+                        full_response = ""
+                        last_content = ""
+                        
+                        # Process streaming response
+                        async for chunk in self._handle_streaming_response(response):
+                            # Extract content from various API formats
+                            if 'message' in chunk and 'content' in chunk['message']:
+                                content = chunk['message']['content']
+                            elif 'response' in chunk:
+                                content = chunk['response']
+                            elif 'content' in chunk:
+                                content = chunk['content']
+                            else:
+                                # Skip chunks without content
+                                continue
+                                
+                            # Append only new content
+                            if content != last_content:
+                                delta = content[len(last_content):]
+                                full_response += delta
+                                last_content = content
+                        
+                        response_time = time.time() - start_time
+                        self.stats['total_response_time'] += response_time
+                        self.stats['successful_requests'] += 1
+                        
+                        self.logger.info(f"Streamed request completed in {response_time:.2f}s, received {len(full_response)} chars")
+                        
+                        # Cache the complete response
+                        if cache_key:
+                            self.cache_manager.cache_result(cache_key, full_response)
+                            
+                        return full_response
+                    else:
+                        error_text = await response.text()
+                        self.logger.warning(f"Streamed request failed (attempt {attempt + 1}): {response.status} - {error_text}")
+                        
+                        # Handle rate limiting
+                        if response.status == 429:
+                            wait_time = 2 ** attempt  # Exponential backoff
+                            self.logger.info(f"Rate limited, waiting {wait_time}s before retry")
+                            await asyncio.sleep(wait_time)
+                        # Handle server errors
+                        elif response.status >= 500:
+                            wait_time = 1 * (attempt + 1)  # Linear backoff
+                            self.logger.info(f"Server error, waiting {wait_time}s before retry")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            # Don't retry on client errors (except rate limits)
+                            if response.status != 429 and response.status < 500:
+                                break
+                            
+                            wait_time = self.retry_delay
+                            await asyncio.sleep(wait_time)
+                        
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Streamed request timeout after {request_timeout}s (attempt {attempt + 1})")
+                
+                # Increase timeout for next retry
+                if attempt < self.max_retries:
+                    request_timeout = min(request_timeout * 1.5, 300.0)  # Up to 5 minutes max for streaming
+                    self.logger.info(f"Increasing timeout to {request_timeout}s for next attempt")
+                    await asyncio.sleep(self.retry_delay)
+                    
+            except Exception as e:
+                self.logger.error(f"Streamed request error (attempt {attempt + 1}): {str(e)}")
+                
+                if attempt < self.max_retries:
+                    wait_time = self.retry_delay * (attempt + 1)
+                    self.logger.info(f"Waiting {wait_time}s before retry")
+                    await asyncio.sleep(wait_time)
+        
+        # All retries failed
+        self.stats['failed_requests'] += 1
+        
+        # Return default response on failure if skip_on_error is enabled
+        if self.skip_on_error:
+            self.logger.warning(f"Streamed request failed after {self.max_retries} attempts, returning default response")
+            return json.dumps({
+                "status": "skipped",
+                "error": f"Streaming API request failed after {self.max_retries} attempts",
+                "segments": [],
+                "analysis": "Basic analysis used due to streaming timeout"
+            })
+        
+        raise Exception(f"Streaming API request failed after {self.max_retries} attempts")
+        
+    async def analyze_subject_priority(self, transcription: Dict) -> Dict:
+        """
+        Analyze transcript to determine subject priorities.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Subject priority recommendations
+        """
+        prompt = ZOOM_ANALYSIS_PROMPTS['subject_priority'].format(
+            transcription=json.dumps(transcription, indent=2)
+        )
+        
+        # Check if this is a large request that may benefit from streaming
+        is_large_request = len(json.dumps(transcription)) > 5000
+        
+        if is_large_request:
+            response = await self._make_streamed_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"subject_priority_{hash(str(transcription))}"
+            )
+        else:
+            response = await self._make_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"subject_priority_{hash(str(transcription))}"
+            )
+        
+        return self._parse_json_response(response)
+    
+    async def analyze_zoom_transitions(self, transcription: Dict) -> Dict:
+        """
+        Analyze content flow to suggest zoom transitions.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Zoom transition recommendations
+        """
+        prompt = ZOOM_ANALYSIS_PROMPTS['zoom_transitions'].format(
+            transcription=json.dumps(transcription, indent=2)
+        )
+        
+        # Check if this is a large request that may benefit from streaming
+        is_large_request = len(json.dumps(transcription)) > 5000
+        
+        if is_large_request:
+            response = await self._make_streamed_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"zoom_transitions_{hash(str(transcription))}"
+            )
+        else:
+            response = await self._make_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"zoom_transitions_{hash(str(transcription))}"
+            )
+        
+        return self._parse_json_response(response)
+    
+    async def analyze_content_engagement(self, transcription: Dict) -> Dict:
+        """
+        Analyze content for engagement potential.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Content engagement analysis
+        """
+        # Choose prompt based on fast mode setting
+        if self.fast_mode and 'engagement_analysis' in FAST_ZOOM_ANALYSIS_PROMPTS:
+            prompt = FAST_ZOOM_ANALYSIS_PROMPTS['engagement_analysis'].format(
+                content=json.dumps(transcription, indent=2)
+            )
+        else:
+            prompt = ZOOM_ANALYSIS_PROMPTS['content_engagement'].format(
+                transcription=json.dumps(transcription, indent=2)
+            )
+        
+        # Check if this is a large request that may benefit from streaming
+        is_large_request = len(json.dumps(transcription)) > 5000
+        
+        if is_large_request:
+            response = await self._make_streamed_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"content_engagement_{hash(str(transcription))}"
+            )
+        else:
+            response = await self._make_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=f"content_engagement_{hash(str(transcription))}"
+            )
+        
+        return self._parse_json_response(response)
+    
+    async def detect_scene_breaks(self, transcription: Dict) -> Dict:
+        """
+        Detect natural scene breaks in content.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Scene break recommendations
+        """
+        prompt = ZOOM_ANALYSIS_PROMPTS['scene_detection'].format(
+            transcription=json.dumps(transcription, indent=2)
+        )
+        
+        response = await self._make_request(
+            prompt=prompt,
+            model=self.get_best_model("analysis"),
+            cache_key=f"scene_detection_{hash(str(transcription))}"
+        )
+        
+        return self._parse_json_response(response)
+    
+    async def classify_content_type(self, transcription: Dict) -> Dict:
+        """
+        Classify content type and determine optimal approach.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Content classification and recommendations
+        """
+        prompt = CONTENT_ANALYSIS_PROMPTS['topic_classification'].format(
+            transcription=json.dumps(transcription, indent=2)
+        )
+        
+        response = await self._make_request(
+            prompt=prompt,
+            model=self.get_best_model("analysis"),
+            cache_key=f"content_classification_{hash(str(transcription))}"
+        )
+        
+        return self._parse_json_response(response)
+    
+    async def analyze_emotional_tone(self, transcription: Dict) -> Dict:
+        """
+        Analyze emotional tone throughout the content.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Emotional analysis with framing recommendations
+        """
+        prompt = CONTENT_ANALYSIS_PROMPTS['emotional_analysis'].format(
+            transcription=json.dumps(transcription, indent=2)
+        )
+        
+        response = await self._make_request(
+            prompt=prompt,
+            model=self.get_best_model("analysis"),
+            cache_key=f"emotional_analysis_{hash(str(transcription))}"
+        )
+        
+        return self._parse_json_response(response)
+    
+    async def detect_action_moments(self, transcription: Dict) -> Dict:
+        """
+        Detect action-oriented moments requiring special framing.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Action moment analysis
+        """
+        prompt = CONTENT_ANALYSIS_PROMPTS['action_detection'].format(
+            transcription=json.dumps(transcription, indent=2)
+        )
+        
+        response = await self._make_request(
+            prompt=prompt,
+            model=self.get_best_model("vision"),  # Use vision model for action detection
+            cache_key=f"action_detection_{hash(str(transcription))}"
+        )
+        
+        return self._parse_json_response(response)
+    
+    async def generate_comprehensive_analysis(self, transcription: Dict) -> Dict:
+        """
+        Generate comprehensive analysis combining all analysis types with optimized request handling.
+        
+        Args:
+            transcription: Whisper transcription result
+            
+        Returns:
+            Comprehensive analysis results
+        """
+        # Determine if this is a large transcription
+        transcription_size = len(json.dumps(transcription))
+        large_threshold = self.streaming_settings.get("large_request_threshold", 5000)
+        very_large_threshold = self.streaming_settings.get("very_large_threshold", 15000)
+        
+        # For very large transcriptions, use a more focused approach
+        is_very_large_request = transcription_size > very_large_threshold
+        
+        # For moderately large requests, use streaming
+        is_large_request = transcription_size > large_threshold
+        
+        if is_very_large_request:
+            self.logger.info(f"Very large transcription detected ({len(json.dumps(transcription))} chars). Using optimized analysis strategy.")
+            
+            # For very large requests, run only the most critical analyses
+            # and run them sequentially to avoid overwhelming the API
+            analyses = []
+            
+            try:
+                # Get framing strategy first (most important)
+                framing_strategy = await self.analyze_framing_strategy(transcription)
+                analyses.append(framing_strategy)
+                
+                # Get content engagement next (also critical)
+                content_engagement = await self.analyze_content_engagement(transcription)
+                analyses.append(content_engagement)
+                
+                # Get scene breaks last (useful for segmentation)
+                scene_breaks = await self.detect_scene_breaks(transcription)
+                analyses.append(scene_breaks)
+                
+            except Exception as e:
+                self.logger.error(f"Error in sequential very large analysis: {str(e)}")
+                # Continue with what we have
+            
+            # Combine results (handling any exceptions)
+            comprehensive_analysis = {
+                'framing_strategy': analyses[0] if len(analyses) > 0 and not isinstance(analyses[0], Exception) else {},
+                'content_engagement': analyses[1] if len(analyses) > 1 and not isinstance(analyses[1], Exception) else {},
+                'scene_breaks': analyses[2] if len(analyses) > 2 and not isinstance(analyses[2], Exception) else {},
+                'analysis_method': 'optimized_large_content',
+                'content_size': len(json.dumps(transcription)),
+                'analysis_errors': [str(a) for a in analyses if isinstance(a, Exception)]
+            }
+            
+            return comprehensive_analysis
+            
+        # For moderately large requests, run analyses in parallel but use streaming
+        elif is_large_request:
+            self.logger.info(f"Large transcription detected ({len(json.dumps(transcription))} chars). Using streamed analysis.")
+            
+            # Run analyses in parallel with streamed requests
+            analyses = await asyncio.gather(
+                self.analyze_framing_strategy(transcription),
+                self.analyze_subject_priority(transcription),
+                self.analyze_zoom_transitions(transcription),
+                self.analyze_content_engagement(transcription),
+                self.detect_scene_breaks(transcription),
+                return_exceptions=True
+            )
+            
+            # Run additional analyses if the first set succeeded
+            if not all(isinstance(a, Exception) for a in analyses):
+                additional_analyses = await asyncio.gather(
+                    self.classify_content_type(transcription),
+                    self.analyze_emotional_tone(transcription),
+                    return_exceptions=True
+                )
+                analyses.extend(additional_analyses)
+            
+        # For normal sized requests, run everything in parallel with standard requests
+        else:
+            self.logger.info(f"Normal transcription size ({len(json.dumps(transcription))} chars). Using standard analysis.")
+            
+            # Run all analyses concurrently
+            analyses = await asyncio.gather(
+                self.analyze_framing_strategy(transcription),
+                self.analyze_subject_priority(transcription),
+                self.analyze_zoom_transitions(transcription),
+                self.analyze_content_engagement(transcription),
+                self.detect_scene_breaks(transcription),
+                self.classify_content_type(transcription),
+                self.analyze_emotional_tone(transcription),
+                self.detect_action_moments(transcription),
+                return_exceptions=True
+            )
+        
+        # Combine results
+        comprehensive_analysis = {
+            'framing_strategy': analyses[0] if not isinstance(analyses[0], Exception) else {},
+            'subject_priority': analyses[1] if not isinstance(analyses[1], Exception) else {},
+            'zoom_transitions': analyses[2] if not isinstance(analyses[2], Exception) else {},
+            'content_engagement': analyses[3] if not isinstance(analyses[3], Exception) else {},
+            'scene_breaks': analyses[4] if not isinstance(analyses[4], Exception) else {},
+            'content_classification': analyses[5] if len(analyses) > 5 and not isinstance(analyses[5], Exception) else {},
+            'emotional_analysis': analyses[6] if len(analyses) > 6 and not isinstance(analyses[6], Exception) else {},
+            'action_detection': analyses[7] if len(analyses) > 7 and not isinstance(analyses[7], Exception) else {},
+            'analysis_method': 'streamed' if is_large_request else 'standard',
+            'content_size': len(json.dumps(transcription)),
+            'analysis_errors': [str(a) for a in analyses if isinstance(a, Exception)]
+        }
+        
+        # Log success rate
+        success_count = sum(1 for a in analyses if not isinstance(a, Exception))
+        total_count = len(analyses)
+        success_rate = success_count / total_count if total_count > 0 else 0
+        self.logger.info(f"Comprehensive analysis completed with {success_count}/{total_count} successful analyses ({success_rate:.1%})")
+        
+        return comprehensive_analysis
+    
+    async def _make_request(self, 
+                          prompt: str,
+                          model: str = "mistral-small3.2:latest",
+                          cache_key: str = None,
+                          images: List[str] = None) -> str:
+        """
+        Make request to Ollama API with improved error handling and retry strategy.
+        
+        Args:
+            prompt: Prompt to send
+            model: Model to use
+            cache_key: Cache key for response caching
+            images: List of base64 encoded images for vision models
+            
+        Returns:
+            API response text
+        """
+        # Check cache first with optimized cache key handling
+        if cache_key:
+            cached_response = self.cache_manager.get_cached_result(cache_key)
+            if cached_response:
+                self.stats['cache_hits'] += 1
+                return cached_response
+        
+        # Create session if not exists
+        if not self.session:
+            await self._create_session()
+        
+        # Fetch models if not already done
+        if not self._models_fetched:
+            await self._fetch_models()
+        
+        # Calculate prompt complexity for adaptive parameters
+        prompt_length = len(prompt)
+        is_complex_request = prompt_length > 1000
+        is_vision_request = images is not None and len(images) > 0
+        
+        # Get parameters from configuration
+        temperature = self.request_settings.get("temperature", 0.1)
+        default_num_predict = self.request_settings.get("num_predict", 768)
+        default_ctx_size = self.request_settings.get("num_ctx", 4096)
+        keep_alive = self.request_settings.get("keep_alive", "20m")
+        use_adaptive_params = self.performance_settings.get("adaptive_timeouts", True)
+        
+        # Adaptive parameter selection based on request complexity
+        if use_adaptive_params:
+            num_predict = default_num_predict  # Default token limit
+            ctx_size = default_ctx_size    # Default context size
+            
+            if is_complex_request:
+                # For longer prompts, increase output token limit
+                num_predict = min(default_num_predict * 1.5, 1024)
+                # For very long prompts, increase context window
+                if prompt_length > 2000:
+                    ctx_size = min(default_ctx_size * 1.5, 8192)
+            
+            if is_vision_request:
+                # Vision requests may need more tokens
+                num_predict = min(default_num_predict * 2, 1536)
+                ctx_size = min(default_ctx_size * 2, 8192)
+        else:
+            # Use default parameters if adaptive params are disabled
+            num_predict = default_num_predict
+            ctx_size = default_ctx_size
+        
+        # Prepare request data with dynamic optimizations
+        request_data = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "stream": False,
+            "options": {
+                "temperature": temperature,      # Configured temperature
+                "top_p": 0.9,                    # Standard sampling threshold
+                "num_predict": int(num_predict), # Dynamic token limit based on complexity
+                "num_ctx": int(ctx_size),        # Dynamic context size
+                "keep_alive": keep_alive,        # Configured keep-alive
+                "top_k": 40,                     # Standard top_k sampling
+                "repeat_penalty": 1.1            # Slight penalty to avoid repetition
+            },
+            "format": "json"  # Simplified format specification for compatibility
+        }
+        
+        # Add images for vision requests
+        if images:
+            request_data["messages"][0]["images"] = images
+        
+        # Prepare headers
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+            # "Authorization": f"Bearer {self.bearer_token}"
+        }
+        
+        # Calculate adaptive timeout based on complexity
+        request_timeout = self.timeout
+        if is_complex_request:
+            # Increase timeout for complex requests
+            request_timeout *= 1.5
+        if is_vision_request:
+            # Vision requests need even more time
+            request_timeout *= 2
+            
+        # Cap maximum timeout
+        request_timeout = min(request_timeout, 180.0)  # Max 3 minutes
+        
+        # Prepare for exponential backoff with jitter
+        base_delay = self.retry_delay
+        max_delay = 15.0  # Maximum backoff delay
+        
+        # Make request with adaptive retry strategy
+        for attempt in range(self.max_retries + 1):  # +1 for the initial attempt
+            try:
+                start_time = time.time()
+                self.stats['total_requests'] += 1
+                
+                # Use the correct URL format
+                url = f"{self.base_url}/api/chat"
+                
+                # Add attempt number to logs for better tracking
+                attempt_str = f"Attempt {attempt + 1}/{self.max_retries + 1}"
+                if attempt > 0:
+                    self.logger.info(f"{attempt_str}: Retrying request to {url}")
+                
+                # Create timeout specific to this request
+                timeout = aiohttp.ClientTimeout(total=request_timeout)
+                
+                async with self.session.post(
+                    url,
+                    headers=headers,
+                    json=request_data,
+                    timeout=timeout
+                ) as response:
+                    response_time = time.time() - start_time
+                    self.stats['total_response_time'] += response_time
+                    
+                    # Log response time for performance monitoring
+                    self.logger.debug(f"{attempt_str}: Response received in {response_time:.2f}s with status {response.status}")
+                    
+                    if response.status == 200:
+                        # Success case
+                        result = await response.json()
+                        
+                        # Extract response text from different API formats
+                        if 'message' in result:
+                            # New chat API format
+                            response_text = result['message'].get('content', '{}')
+                        else:
+                            # Old API format
+                            response_text = result.get('response', '{}')
+                        
+                        # Cache successful response
+                        if cache_key:
+                            self.cache_manager.cache_result(cache_key, response_text)
+                        
+                        self.stats['successful_requests'] += 1
+                        return response_text
+                    elif response.status == 429:  # Rate limiting
+                        error_text = await response.text()
+                        self.logger.warning(f"{attempt_str}: Rate limited ({response.status}): {error_text}")
+                        
+                        # Check for Retry-After header for proper rate limit handling
+                        retry_after = response.headers.get('Retry-After')
+                        if retry_after:
+                            try:
+                                wait_seconds = float(retry_after)
+                                self.logger.info(f"{attempt_str}: Waiting {wait_seconds}s as specified by Retry-After header")
+                                await asyncio.sleep(wait_seconds)
+                                continue
+                            except ValueError:
+                                pass  # Invalid Retry-After header, use default backoff
+                        
+                        # Use exponential backoff for rate limiting
+                        if attempt < self.max_retries:
+                            backoff = min(max_delay, base_delay * (2 ** attempt))
+                            # Add jitter to prevent thundering herd
+                            jitter = backoff * 0.2 * (2 * (0.5 - time.time() % 1))
+                            wait_time = backoff + jitter
+                            self.logger.info(f"{attempt_str}: Rate limit backoff for {wait_time:.2f}s")
+                            await asyncio.sleep(wait_time)
+                    elif response.status >= 500:  # Server errors
+                        error_text = await response.text()
+                        self.logger.warning(f"{attempt_str}: Server error ({response.status}): {error_text}")
+                        
+                        # Linear backoff for server errors
+                        if attempt < self.max_retries:
+                            wait_time = base_delay * (attempt + 1)
+                            self.logger.info(f"{attempt_str}: Server error backoff for {wait_time:.2f}s")
+                            await asyncio.sleep(wait_time)
+                    else:  # Other errors
+                        error_text = await response.text()
+                        # Try to parse error JSON for better error reporting
+                        try:
+                            error_json = await response.json()
+                            if 'error' in error_json:
+                                self.logger.error(f"{attempt_str}: API error ({response.status}): {error_json['error']}")
+                            else:
+                                self.logger.error(f"{attempt_str}: API error ({response.status}): {error_text}")
+                        except:
+                            self.logger.error(f"{attempt_str}: API error ({response.status}): {error_text}")
+                        
+                        # Don't retry for client errors (except rate limiting)
+                        if response.status < 500 and response.status != 429:
+                            break
+                        
+                        # Minimal backoff for other errors
+                        if attempt < self.max_retries:
+                            await asyncio.sleep(base_delay)
+                        
+            except asyncio.TimeoutError:
+                self.logger.warning(f"{attempt_str}: Request timeout after {request_timeout}s")
+                
+                # Increase timeout for next retry
+                if attempt < self.max_retries:
+                    # Increase timeout by 50% for next attempt, up to max
+                    request_timeout = min(request_timeout * 1.5, 180.0)
+                    self.logger.info(f"{attempt_str}: Increasing timeout to {request_timeout}s for next attempt")
+                    await asyncio.sleep(base_delay)
+                    
+            except aiohttp.ClientConnectorError as e:
+                self.logger.error(f"{attempt_str}: Connection error: {str(e)}")
+                
+                # Exponential backoff for connection errors
+                if attempt < self.max_retries:
+                    backoff = min(max_delay, base_delay * (2 ** attempt))
+                    self.logger.info(f"{attempt_str}: Connection error backoff for {backoff:.2f}s")
+                    await asyncio.sleep(backoff)
+                    
+            except aiohttp.ClientError as e:
+                self.logger.error(f"{attempt_str}: Client error: {str(e)}")
+                
+                # Linear backoff for other client errors
+                if attempt < self.max_retries:
+                    wait_time = base_delay * (attempt + 1)
+                    self.logger.info(f"{attempt_str}: Client error backoff for {wait_time:.2f}s")
+                    await asyncio.sleep(wait_time)
+        
+        # All retries failed
+        self.stats['failed_requests'] += 1
+        
+        # If skip_on_error is enabled, return a default response instead of raising exception
+        if self.skip_on_error:
+            self.logger.warning(f"Ollama API failed after {self.max_retries} attempts, returning default response")
+            return json.dumps({
+                "status": "skipped",
+                "error": f"API failed after {self.max_retries} attempts",
+                "segments": [],
+                "analysis": "Basic analysis used due to API timeout",
+                "prompt_length": prompt_length,
+                "request_complexity": "high" if is_complex_request else "normal",
+                "vision_request": is_vision_request
+            })
+        
+        raise Exception(f"Ollama API request failed after {self.max_retries} attempts")
+    
+    def _parse_json_response(self, response: str) -> Dict:
+        """
+        Parse JSON response from Ollama API with enhanced error handling.
+        
+        Args:
+            response: Raw response text
+            
+        Returns:
+            Parsed JSON dictionary
+        """
+        if not response:
+            self.logger.warning("Empty response received from API")
+            return {
+                'error': 'Empty response',
+                'raw_response': '',
+                'segments': [],
+                'score': 0.5,
+                'status': 'empty_response'
+            }
+            
+        try:
+            # Try to extract JSON from response
+            response = response.strip()
+            
+            # First try: direct JSON parsing
+            if response.startswith('{') and response.endswith('}'):
+                try:
+                    return json.loads(response)
+                except json.JSONDecodeError:
+                    # Continue to other extraction methods if this fails
+                    pass
+            
+            # Second try: JSON in markdown code blocks
+            json_patterns = [
+                # Standard markdown JSON block
+                r'```json\s+(.*?)\s+```',
+                # Alternative markdown block
+                r'```\s+({\s*".*?})\s+```',
+                # JSON with language specifier
+                r'```[a-z]*\s+({.*?})\s+```',
+                # Plain JSON with triple backticks
+                r'```(.*?)```'
+            ]
+            
+            for pattern in json_patterns:
+                import re
+                matches = re.findall(pattern, response, re.DOTALL)
+                if matches:
+                    for potential_json in matches:
+                        try:
+                            parsed = json.loads(potential_json.strip())
+                            return parsed
+                        except json.JSONDecodeError:
+                            continue
+            
+            # Third try: Find JSON object anywhere in the text
+            json_start_pos = response.find('{')
+            if json_start_pos != -1:
+                # Track nested braces to find the correct closing brace
+                brace_count = 0
+                in_string = False
+                escape_next = False
+                
+                for i in range(json_start_pos, len(response)):
+                    char = response[i]
+                    
+                    # Handle string literals correctly
+                    if char == '\\' and not escape_next:
+                        escape_next = True
+                        continue
+                    
+                    if char == '"' and not escape_next:
+                        in_string = not in_string
+                    
+                    escape_next = False
+                    
+                    if not in_string:
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            
+                        # Found the matching closing brace
+                        if brace_count == 0 and i > json_start_pos:
+                            json_text = response[json_start_pos:i+1]
+                            try:
+                                return json.loads(json_text)
+                            except json.JSONDecodeError:
+                                # Try next occurrence
+                                continue
+            
+            # Fourth try: Split by lines and look for JSON objects
+            lines = response.split('\n')
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if line.startswith('{') and line.endswith('}'):
+                    try:
+                        return json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Final fallback: try to extract a partial JSON with key-value pairs
+            # This handles cases where the model started generating JSON but got cut off
+            extracted_data = {}
+            
+            # Look for key-value patterns like "key": "value" or "key": number
+            import re
+            kv_pairs = re.findall(r'"([^"]+)"\s*:\s*("[^"]*"|\d+\.?\d*|true|false|null|\[.*?\])', response)
+            
+            if kv_pairs:
+                # Reconstruct partial JSON
+                json_text = '{' + ','.join([f'"{k}": {v}' for k, v in kv_pairs]) + '}'
+                try:
+                    return json.loads(json_text)
+                except json.JSONDecodeError:
+                    pass
+            
+            # If no valid JSON found, extract meaningful content for the default response
+            sanitized_response = response.replace('```', '').strip()
+            # Truncate if too long
+            if len(sanitized_response) > 500:
+                sanitized_response = sanitized_response[:497] + '...'
+                
+            # If we couldn't extract proper JSON, try to build a usable structure
+            # from the raw text response
+            segments = []
+            lines = sanitized_response.split('\n')
+            current_segment = None
+            
+            for line in lines:
+                # Look for timestamps or time markers
+                time_patterns = [
+                    r'(\d+:\d+) - (\d+:\d+)',  # 00:00 - 01:30 format
+                    r'(\d+\.\d+)s to (\d+\.\d+)s',  # 10.5s to 20.8s format
+                    r'(\d+\.\d+)-(\d+\.\d+)',  # 10.5-20.8 format
+                    r'time: (\d+\.\d+)-(\d+\.\d+)'  # time: 10.5-20.8 format
+                ]
+                
+                found_time = False
+                for pattern in time_patterns:
+                    time_match = re.search(pattern, line)
+                    if time_match:
+                        found_time = True
+                        start_str, end_str = time_match.groups()
+                        
+                        # Try to convert to seconds
+                        try:
+                            # Handle MM:SS format
+                            if ':' in start_str:
+                                mins, secs = start_str.split(':')
+                                start_time = float(mins) * 60 + float(secs)
+                                mins, secs = end_str.split(':')
+                                end_time = float(mins) * 60 + float(secs)
+                            else:
+                                # Already in seconds
+                                start_time = float(start_str)
+                                end_time = float(end_str)
+                                
+                            # Store as a segment
+                            current_segment = {
+                                'start_time': start_time,
+                                'end_time': end_time,
+                                'description': line,
+                                'confidence': 0.6  # Medium confidence for extracted data
+                            }
+                            segments.append(current_segment)
+                        except ValueError:
+                            # Failed to parse time, ignore
+                            pass
+                        break
+                
+                # If no time marker but we have a current segment, add text to its description
+                if not found_time and current_segment and line.strip():
+                    current_segment['description'] += " " + line.strip()
+            
+            # Create a default response with any extracted segments
+            self.logger.warning(f"No valid JSON found in response, created structured response with {len(segments)} extracted segments")
+            return {
+                'error': 'Failed to parse as JSON',
+                'raw_response': sanitized_response,
+                'segments': segments,
+                'score': 0.5,
+                'status': 'fallback_structured_response'
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Failed to parse response: {str(e)}")
+            
+            # Return default result with error info
+            truncated_response = response[:200] + '...' if len(response) > 200 else response
+            return {
+                'error': f'Failed to parse response: {str(e)}',
+                'raw_response': truncated_response,
+                'json_error': str(e),
+                'segments': [],
+                'score': 0.5,
+                'status': 'parse_error'
+            }
+    
+    async def test_connection(self) -> Dict:
+        """
+        Test connection to Ollama API.
+        
+        Returns:
+            Connection test results
+        """
+        try:
+            response = await self._make_request(
+                prompt="Test connection. Respond with 'Connection successful'.",
+                model=self.get_best_model("text"),
+                cache_key="test_connection"
+            )
+            
+            return {
+                'status': 'success',
+                'response': response,
+                'message': 'Connection to Ollama API successful'
+            }
+            
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e),
+                'message': 'Failed to connect to Ollama API'
+            }
+    
+    async def test_vision_capabilities(self, image_path: str = None) -> Dict:
+        """
+        Test vision capabilities of available models.
+        
+        Args:
+            image_path: Optional path to test image
+            
+        Returns:
+            Vision capability test results
+        """
+        try:
+            vision_models = [m for m in self._available_models if 'vision' in m['name'].lower()]
+            
+            if not vision_models:
+                return {
+                    'status': 'no_vision_models',
+                    'message': 'No vision-capable models available',
+                    'available_models': [m['name'] for m in self._available_models]
+                }
+            
+            # Test with a simple vision prompt
+            vision_model = vision_models[0]['name']
+            
+            if image_path:
+                # If image provided, test with actual image
+                import base64
+                with open(image_path, 'rb') as image_file:
+                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                
+                prompt = "Describe what you see in this image."
+                
+                # Use the updated _make_request method with images
+                response_text = await self._make_request(
+                    prompt=prompt,
+                    model=vision_model,
+                    cache_key="test_vision_with_image",
+                    images=[image_data]
+                )
+                
+                return {
+                    'status': 'success',
+                    'vision_model': vision_model,
+                    'response': response_text,
+                    'has_vision': True,
+                    'message': 'Vision capabilities confirmed with image'
+                }
+            else:
+                # Test without image
+                prompt = "Can you process images? Respond with 'Yes, I can process images' if you have vision capabilities."
+                
+                response_text = await self._make_request(
+                    prompt=prompt,
+                    model=vision_model,
+                    cache_key="test_vision_no_image"
+                )
+                
+                return {
+                    'status': 'success',
+                    'vision_model': vision_model,
+                    'response': response_text,
+                    'has_vision': True,
+                    'message': 'Vision capabilities test completed'
+                }
+                    
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e),
+                'message': 'Failed to test vision capabilities'
+            }
+    
+    async def analyze_image_with_transcript(self, image_path: str, transcript: str) -> Dict:
+        """
+        Analyze an image in context of a transcript for better framing decisions.
+        
+        Args:
+            image_path: Path to the image file
+            transcript: Transcript context
+            
+        Returns:
+            Combined image and text analysis
+        """
+        try:
+            vision_model = self.get_best_model("vision")
+            
+            # Prepare image
+            import base64
+            with open(image_path, 'rb') as image_file:
+                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+            
+            prompt = f"""
+            Analyze this image in the context of the following transcript:
+            
+            Transcript: {transcript}
+            
+            Please provide:
+            1. What subjects/people are visible in the image?
+            2. What is the optimal framing for vertical video (9:16 aspect ratio)?
+            3. Where should the camera focus for best engagement?
+            4. Any recommended zoom level or crop position?
+            5. How does the visual content relate to the audio transcript?
+            
+            Respond in JSON format with your analysis.
+            """
+            
+            # Use the updated _make_request method with images
+            response_text = await self._make_request(
+                prompt=prompt,
+                model=vision_model,
+                cache_key=f"vision_analysis_{hash(image_path + transcript)}",
+                images=[image_data]
+            )
+            
+            return self._parse_json_response(response_text)
+                    
+        except Exception as e:
+            return {
+                'error': f'Failed to analyze image: {str(e)}',
+                'image_path': image_path
+            }
+    
+    def get_stats(self) -> Dict:
+        """
+        Get client statistics.
+        
+        Returns:
+            Statistics dictionary
+        """
+        avg_response_time = (
+            self.stats['total_response_time'] / self.stats['total_requests']
+            if self.stats['total_requests'] > 0 else 0
+        )
+        
+        return {
+            'total_requests': self.stats['total_requests'],
+            'successful_requests': self.stats['successful_requests'],
+            'failed_requests': self.stats['failed_requests'],
+            'cache_hits': self.stats['cache_hits'],
+            'success_rate': (
+                self.stats['successful_requests'] / self.stats['total_requests']
+                if self.stats['total_requests'] > 0 else 0
+            ),
+            'cache_hit_rate': (
+                self.stats['cache_hits'] / (self.stats['total_requests'] + self.stats['cache_hits'])
+                if (self.stats['total_requests'] + self.stats['cache_hits']) > 0 else 0
+            ),
+            'average_response_time': avg_response_time
+        }
+    
+    def reset_stats(self):
+        """Reset client statistics."""
+        self.stats = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'cache_hits': 0,
+            'total_response_time': 0.0
+        }
+    
+    async def cleanup(self):
+        """Clean up resources."""
+        if self.session:
+            await self._close_session()
+        
+        self.logger.info("OllamaClient cleanup completed")
+        
+    async def preload_model(self, model_name: str = None):
+        """
+        Preload a model to keep it in memory for faster subsequent requests.
+        
+        Args:
+            model_name: Name of model to preload, or None to use best model
+        """
+        if model_name is None:
+            model_name = self.get_best_model("analysis")
+            
+        try:
+            self.logger.info(f"Preloading model {model_name} to keep it in memory")
+            
+            # Make a simple request to load the model into memory
+            request_data = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": "Hello, this is a warmup request to keep you in memory."
+                    }
+                ],
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "top_p": 0.9,
+                    "num_predict": 10,  # Very small for fast response
+                    "keep_alive": "30m"  # Keep model in memory for 30 minutes
+                }
+            }
+            
+            # Create session if not exists
+            if not self.session:
+                await self._create_session()
+                
+            # Use the correct URL format
+            url = f"{self.base_url}/api/chat"
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            async with self.session.post(
+                url,
+                headers=headers,
+                json=request_data,
+                timeout=aiohttp.ClientTimeout(total=10.0)  # Short timeout for warmup
+            ) as response:
+                if response.status == 200:
+                    self.logger.info(f"Successfully preloaded model {model_name}")
+                    await response.json()  # Consume response
+                else:
+                    error_text = await response.text()
+                    self.logger.warning(f"Failed to preload model {model_name}: {error_text}")
+                    
+        except Exception as e:
+            self.logger.warning(f"Error preloading model {model_name}: {str(e)}")
+            
+    async def bulk_analyze(self, transcription_segments: List[Dict], analysis_type: str) -> List[Dict]:
+        """
+        Perform bulk analysis on multiple segments to optimize API usage.
+        
+        Args:
+            transcription_segments: List of transcript segments to analyze
+            analysis_type: Type of analysis to perform ('framing', 'subject', 'zoom', etc.)
+            
+        Returns:
+            List of analysis results for each segment
+        """
+        if not transcription_segments:
+            return []
+            
+        # Determine prompt template based on analysis type
+        prompt_template = None
+        if analysis_type == 'framing':
+            prompts = FAST_ZOOM_ANALYSIS_PROMPTS if self.fast_mode else ZOOM_ANALYSIS_PROMPTS
+            prompt_template = prompts.get('framing_strategy', '')
+        elif analysis_type == 'subject':
+            prompt_template = ZOOM_ANALYSIS_PROMPTS.get('subject_priority', '')
+        elif analysis_type == 'zoom':
+            prompt_template = ZOOM_ANALYSIS_PROMPTS.get('zoom_transitions', '')
+        elif analysis_type == 'engagement':
+            if self.fast_mode and 'engagement_analysis' in FAST_ZOOM_ANALYSIS_PROMPTS:
+                prompt_template = FAST_ZOOM_ANALYSIS_PROMPTS.get('engagement_analysis', '')
+            else:
+                prompt_template = ZOOM_ANALYSIS_PROMPTS.get('content_engagement', '')
+        
+        if not prompt_template:
+            self.logger.error(f"No prompt template found for analysis type: {analysis_type}")
+            return [{'error': 'Invalid analysis type'} for _ in transcription_segments]
+            
+        # Use batched processing if there are many segments
+        if len(transcription_segments) > 5:
+            # Process in batches of 5
+            batch_size = 5
+            batches = [transcription_segments[i:i+batch_size] for i in range(0, len(transcription_segments), batch_size)]
+            
+            results = []
+            for batch in batches:
+                batch_results = await asyncio.gather(
+                    *[self._analyze_single_segment(segment, prompt_template, analysis_type) 
+                     for segment in batch],
+                    return_exceptions=True
+                )
+                
+                # Handle exceptions
+                processed_results = []
+                for result in batch_results:
+                    if isinstance(result, Exception):
+                        processed_results.append({'error': str(result)})
+                    else:
+                        processed_results.append(result)
+                        
+                results.extend(processed_results)
+                
+                # Brief pause between batches to avoid rate limiting
+                await asyncio.sleep(0.5)
+                
+            return results
+        else:
+            # Process all segments in parallel for smaller sets
+            results = await asyncio.gather(
+                *[self._analyze_single_segment(segment, prompt_template, analysis_type) 
+                 for segment in transcription_segments],
+                return_exceptions=True
+            )
+            
+            # Handle exceptions
+            return [
+                result if not isinstance(result, Exception) else {'error': str(result)}
+                for result in results
+            ]
+    
+    async def _analyze_single_segment(self, segment: Dict, prompt_template: str, analysis_type: str) -> Dict:
+        """
+        Analyze a single transcript segment.
+        
+        Args:
+            segment: Transcript segment to analyze
+            prompt_template: Prompt template to use
+            analysis_type: Type of analysis being performed
+            
+        Returns:
+            Analysis result for the segment
+        """
+        # Create cache key based on segment and analysis type
+        segment_hash = hash(json.dumps(segment, sort_keys=True))
+        cache_key = f"{analysis_type}_{segment_hash}"
+        
+        # Format prompt
+        prompt = prompt_template.format(
+            transcription=json.dumps(segment, indent=2),
+            content=json.dumps(segment, indent=2)  # Support both template variables
+        )
+        
+        # Determine if segment is large
+        is_large = len(json.dumps(segment)) > 2000
+        
+        if is_large:
+            response = await self._make_streamed_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=cache_key
+            )
+        else:
+            response = await self._make_request(
+                prompt=prompt,
+                model=self.get_best_model("analysis"),
+                cache_key=cache_key
+            )
+            
+        result = self._parse_json_response(response)
+        
+        # Attach segment metadata to result
+        if 'start_time' in segment:
+            result['start_time'] = segment['start_time']
+        if 'end_time' in segment:
+            result['end_time'] = segment['end_time']
+        if 'text' in segment:
+            result['text'] = segment['text']
+            
+        return result
+
+
+# Utility functions for working with Ollama responses
+def extract_zoom_decisions(ollama_response: Dict) -> List[Dict]:
+    """
+    Extract zoom decisions from Ollama response.
+    
+    Args:
+        ollama_response: Response from Ollama API
+        
+    Returns:
+        List of zoom decisions
+    """
+    if not ollama_response or 'error' in ollama_response:
+        return []
+    
+    # Try to extract segments or decisions
+    segments = ollama_response.get('segments', [])
+    if not segments:
+        segments = ollama_response.get('zoom_decisions', [])
+    
+    # Ensure segments is a list and contains valid data
+    if not isinstance(segments, list):
+        return []
+    
+    # Filter and validate segments
+    valid_segments = []
+    for segment in segments:
+        if isinstance(segment, dict):
+            # Ensure required fields exist
+            if 'start_time' in segment and 'end_time' in segment:
+                valid_segments.append(segment)
+    
+    return valid_segments
+
+
+def merge_analysis_results(analyses: List[Dict]) -> Dict:
+    """
+    Merge multiple analysis results into a single recommendation.
+    
+    Args:
+        analyses: List of analysis results
+        
+    Returns:
+        Merged recommendations
+    """
+    merged = {
+        'zoom_recommendations': [],
+        'scene_breaks': [],
+        'engagement_scores': [],
+        'content_metadata': {},
+        'confidence_score': 0.0
+    }
+    
+    # Process each analysis
+    for analysis in analyses:
+        if 'error' in analysis:
+            continue
+        
+        # Extract zoom recommendations
+        if 'segments' in analysis:
+            merged['zoom_recommendations'].extend(analysis['segments'])
+        
+        # Extract scene breaks
+        if 'scenes' in analysis:
+            merged['scene_breaks'].extend(analysis['scenes'])
+        
+        # Extract engagement data
+        if 'engagement_analysis' in analysis:
+            merged['engagement_scores'].extend(analysis['engagement_analysis'])
+        
+        # Extract metadata
+        if 'content_category' in analysis:
+            merged['content_metadata'].update(analysis)
+    
+    # Calculate overall confidence
+    if merged['zoom_recommendations']:
+        confidences = [
+            rec.get('confidence', 0.5) 
+            for rec in merged['zoom_recommendations']
+        ]
+        merged['confidence_score'] = sum(confidences) / len(confidences)
+    
+    return merged

@@ -1,0 +1,1390 @@
+"""
+Celery tasks for video processing.
+"""
+
+      
+import requests
+import asyncio
+import json
+import logging
+import sys
+import os
+import redis
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+import sys
+from time import time
+import time
+#from src.celebrity_face_detection.pipeline import run_pipeline
+
+# Import thumbnail utility functions
+sys.path.insert(0, str(Path(__file__).parents[2] / "src" / "utils"))
+from thumbnail_generator import generate_thumbnail, upload_thumbnail
+
+# Import JSON utilities for serialization fixes  
+sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
+from utils.json_utils import clean_for_serialization
+
+# Import database API client
+from utils.database_api_client import (
+    DatabaseAPIClient, 
+    create_clip_data, 
+    extract_transcription_text,
+    generate_ai_title_and_description,
+    generate_tags_from_analysis
+)
+
+# Import template processors
+from templates.podcast_template import apply_podcast_template_if_needed
+
+# PERSON_SPLITTING_FIX_APPLIED
+from templates.fixed_podcast_template import apply_fixed_podcast_template
+from templates.optimized_podcast_template import apply_podcast_template_optimized
+
+def apply_robust_podcast_template_processing(input_video_path, output_video_path, template):
+    """Apply robust podcast template with enhanced person splitting."""
+    if template != 'podcast':
+        return input_video_path
+    
+    # Try the fixed template first
+    try:
+        result = apply_fixed_podcast_template(input_video_path, output_video_path, template)
+        if result == output_video_path:
+            return result
+    except Exception as e:
+        logger.warning(f"Fixed podcast template failed: {e}")
+    
+    # Fallback to optimized template
+    try:
+        result = apply_podcast_template_optimized(input_video_path, output_video_path, template)
+        return result
+    except Exception as e:
+        logger.warning(f"Optimized podcast template failed: {e}")
+        return input_video_path
+
+
+from celery import shared_task
+from celery.signals import task_postrun, task_prerun, task_success, task_failure
+
+# Add the project root to the Python path
+sys.path.insert(0, str(Path(__file__).parents[2]))
+
+from main import VideoToShortsProcessor
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# Initialize database API client
+db_api_client = DatabaseAPIClient()
+
+# Redis client for task status tracking
+try:
+    redis_client = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        db=int(os.getenv("REDIS_DB", "0")),
+        password=os.getenv("REDIS_PASSWORD", ""),
+        decode_responses=True,  # Return strings instead of bytes
+        socket_connect_timeout=5,  # Connect timeout in seconds
+        socket_timeout=5,  # Read/write timeout in seconds
+        retry_on_timeout=True  # Retry operations on timeout
+    )
+    # Test connection
+    redis_client.ping()
+    logger.info("Successfully connected to Redis")
+except Exception as e:
+    logger.warning(f"Failed to connect to Redis: {e}. Task status tracking will be limited.")
+    # Create a dummy Redis client for fallback
+    class DummyRedis:
+        def get(self, *args, **kwargs): return None
+        def set(self, *args, **kwargs): return None
+        def sadd(self, *args, **kwargs): return None
+        def srem(self, *args, **kwargs): return None
+        def smembers(self, *args, **kwargs): return set()
+        def ping(self, *args, **kwargs): return False
+    
+    redis_client = DummyRedis()
+
+
+def serialize_dataclasses_in_dict(data: Any) -> Any:
+    """
+    Recursively convert dataclass instances to dictionaries for JSON serialization.
+    
+    Args:
+        data: The data structure to serialize
+        
+    Returns:
+        The serialized data structure with dataclasses converted to dicts
+    """
+    if hasattr(data, 'to_dict'):  # Check if it's a dataclass with to_dict method
+        return data.to_dict()
+    elif isinstance(data, dict):
+        return {key: serialize_dataclasses_in_dict(value) for key, value in data.items()}
+    elif isinstance(data, (list, tuple)):
+        return [serialize_dataclasses_in_dict(item) for item in data]
+    else:
+        return data
+
+
+@shared_task(bind=True, name="process_video_task")
+def process_video_task(self, task_data: Dict) -> Dict:
+    """
+    Process a video with the specified parameters.
+    
+    Args:
+        task_data: Dictionary containing task parameters:
+            - video_id: Unique identifier for the video job
+            - final_video_ids: List of video IDs for the output videos
+            - canvas_type: 'shorts' (9:16) or 'clips' (16:9)
+            - no_of_videos: Number of output videos to generate
+            - min_duration: Minimum duration of each output video in seconds
+            - max_duration: Maximum duration of each output video in seconds
+            - aspect_ratio: Target aspect ratio as string ("9:16", "16:9", etc.)
+            - canvas_aspect_ratio_tuple: Pre-calculated canvas aspect ratio tuple (width, height)
+            - content_aspect_ratio_tuple: Pre-calculated content aspect ratio tuple (width, height)
+            - pubid: Publisher ID
+            - bucket_path: Path to the input video in the storage bucket
+            - storage_bucket: Name of the storage bucket
+    
+    Returns:
+        Dictionary with processing results
+    """
+    logger.info(f"Starting video processing task: {task_data.get('video_id')}")
+    
+    try:
+        # Extract parameters
+        video_id = task_data.get('video_id')
+        uploaded_video_id = task_data.get('uploaded_video_id')
+        
+        # Get effective ID for logging (video_id takes precedence)
+        effective_id = video_id if video_id else uploaded_video_id
+        id_label = f"video_id: {video_id}" if video_id else (f"uploaded_video_id: {uploaded_video_id}" if uploaded_video_id else "unknown")
+        
+        canvas_type = task_data.get('canvas_type', 'shorts')
+        linear_cut = task_data.get('linear_cut', False)  # Extract linear cut flag
+        linear_duration = task_data.get('linear_duration')  # Extract linear duration
+        disable_smart_zoom_linear_cut = task_data.get('disable_smart_zoom_linear_cut', True)  # Extract smart zoom disable flag
+        append_part_number = task_data.get('append_part_number', True)  # Extract part number flag
+        min_duration = task_data.get('min_duration', 15)
+        max_duration = task_data.get('max_duration', 60)
+        no_of_videos = task_data.get('no_of_videos', 5)
+        final_video_ids = task_data.get('final_video_ids', [])
+        subtitle_overlay = task_data.get('subtitle_overlay', False)
+        subtitle_overlay_style_id = task_data.get('subtitle_overlay_style_id', 'cinematic')  # New parameter
+        caption_x = task_data.get('caption_x', 30)  # Extract caption X position (default: 30)
+        caption_y = task_data.get('caption_y', 40)  # Extract caption Y position (default: 40)
+        kinetic_captions = task_data.get('kinetic_captions', True)  # Extract kinetic captions flag (default: True)
+        kinetic_mode = task_data.get('kinetic_mode', 'karaoke')  # Extract kinetic mode (default: karaoke)
+        api_style = task_data.get('subtitle_overlay_style')  # Extract API-provided style object
+        external_srt_url = task_data.get('external_srt_url')  # Optional external SRT URL
+        external_srt_local_path = None
+        user_prompt = task_data.get('user_prompt')  # Extract user prompt
+        llm_provider = task_data.get('llm_provider', 'ollama')  # Extract LLM provider preference
+        ai_reframe = task_data.get('ai_reframe', False)  # Extract AI reframe flag
+        enable_object_detection = task_data.get('enable_object_detection', True)  # Extract object detection flag
+        brand_logo = task_data.get('brand_logo')  # Extract brand logo URL
+        overlay_x = task_data.get('overlay_x', 10)  # Extract logo X position (default: 10)
+        overlay_y = task_data.get('overlay_y', 20)  # Extract logo Y position (default: 20)
+        template = task_data.get('template')  # Extract template type (e.g., 'podcast')
+        template_preset = task_data.get('template_preset', 'balanced')  # Extract template preset (default: balanced)
+        intro_url = task_data.get('intro_url')  # Extract intro video URL
+        outro_url = task_data.get('outro_url')  # Extract outro video URL
+        celebrity_detection = task_data.get('celebrity_detection', False)  # New parameter from API
+        object_detection = task_data.get('object_detection', False)  # New parameter from API
+        reference_image_path = task_data.get('reference_image_path')  # Optional reference image for search
+        
+        # Log duration parameters
+        logger.info(f"Using duration parameters: min_duration={min_duration}s, max_duration={max_duration}s")
+        logger.info(f"Linear cut mode: {linear_cut}")
+        if linear_cut:
+            logger.info(f"Linear duration: {linear_duration}s")
+            logger.info(f"Append part numbers: {append_part_number}")
+        logger.info(f"Subtitle overlay enabled: {subtitle_overlay}")
+        if subtitle_overlay:
+            logger.info(f"Subtitle style ID: {subtitle_overlay_style_id}")
+            logger.info(f"Caption position: X={caption_x}, Y={caption_y}")
+            logger.info(f"Kinetic captions enabled: {kinetic_captions}")
+            logger.info(f"Kinetic mode: {kinetic_mode}")
+            if api_style:
+                logger.info(f"API-provided subtitle_overlay_style: {api_style}")
+            else:
+                logger.info("No API subtitle_overlay_style provided, using config-based styling")
+        logger.info(f"User prompt: {user_prompt}")
+        logger.info(f"LLM provider: {llm_provider}")
+        logger.info(f"AI reframe enabled: {ai_reframe}")
+        logger.info(f"Object detection enabled: {enable_object_detection}")
+        logger.info(f"Brand logo URL: {brand_logo}")
+        logger.info(f"Logo overlay position: X={overlay_x}, Y={overlay_y}")
+        logger.info(f"Template: {template}")
+        logger.info(f"Template preset: {template_preset}")
+        logger.info(f"Intro URL: {intro_url}")
+        logger.info(f"Outro URL: {outro_url}")
+        
+        logger.info(f"Processing {id_label}")
+        
+        # Get canvas aspect ratio - use pre-calculated tuple if available
+        canvas_aspect_ratio = task_data.get('canvas_aspect_ratio_tuple')
+        
+        # If no pre-calculated tuple, determine canvas aspect ratio based on canvas_type
+        if not canvas_aspect_ratio:
+            canvas_aspect_ratio = (9, 16) if canvas_type == 'shorts' else (16, 9)
+            logger.info(f"Using default canvas aspect ratio for {canvas_type}: {canvas_aspect_ratio}")
+        
+        # Get content aspect ratio - use pre-calculated tuple if available
+        content_aspect_ratio = task_data.get('content_aspect_ratio_tuple')
+        
+        # If no content_aspect_ratio_tuple, fall back to aspect_ratio_tuple or aspect_ratio string
+        if not content_aspect_ratio:
+            # Try aspect_ratio_tuple first
+            content_aspect_ratio = task_data.get('aspect_ratio_tuple')
+            
+            # If still not available, try to parse from aspect_ratio string
+            if not content_aspect_ratio:
+                aspect_ratio = task_data.get('aspect_ratio')
+                if aspect_ratio:
+                    try:
+                        width, height = aspect_ratio.split(':')
+                        content_aspect_ratio = (int(width), int(height))
+                        logger.info(f"Using content aspect ratio from string: {aspect_ratio} -> {content_aspect_ratio}")
+                    except (ValueError, TypeError):
+                        # If parsing fails, fall back to canvas aspect ratio
+                        content_aspect_ratio = canvas_aspect_ratio
+                        logger.warning(f"Invalid aspect ratio format: {aspect_ratio}, using canvas aspect ratio as fallback: {content_aspect_ratio}")
+                else:
+                    # If no aspect_ratio string, use canvas aspect ratio
+                    content_aspect_ratio = canvas_aspect_ratio
+                    logger.info(f"No content aspect ratio specified, using canvas aspect ratio: {content_aspect_ratio}")
+        
+        logger.info(f"Processing video {video_id} with canvas_type={canvas_type}, " +
+                    f"canvas_aspect_ratio={canvas_aspect_ratio}, content_aspect_ratio={content_aspect_ratio}")
+        
+        # Download the file from the bucket
+        storage_bucket = task_data.get('storage_bucket')
+        storage_type = task_data.get('storage_type', 'wasabi')  # Default to wasabi for backward compatibility
+        bucket_path = task_data.get('bucket_path')
+        
+        # Validate required parameters
+        if not all([storage_bucket, bucket_path, effective_id]):
+            raise ValueError(f"Missing required parameters: storage_bucket={storage_bucket}, bucket_path={bucket_path}, effective_id={effective_id}")
+        
+        # Set up paths
+        input_dir = os.path.join(os.getcwd(), "input")
+        os.makedirs(input_dir, exist_ok=True)
+        
+        local_path = os.path.join(input_dir, os.path.basename(bucket_path))
+        
+        # Create S3 client based on storage_type
+        import boto3
+        
+        if storage_type.lower() == 'aws':
+            # AWS S3 configuration
+            logger.info(f"Using AWS S3 storage with bucket: {storage_bucket}")
+            s3 = boto3.client(
+                's3',
+                endpoint_url=os.getenv('AWS_HOST'),
+                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_NEW'),
+                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY_NEW')
+            )
+        else:
+            # Wasabi configuration (default)
+            logger.info(f"Using Wasabi storage with bucket: {storage_bucket}")
+            s3 = boto3.client(
+                    's3',
+                    endpoint_url=os.getenv('WASABI_ENDPOINT', 'https://s3.us-east-1.wasabisys.com'),
+                aws_access_key_id=os.getenv('WASABI_ACCESS_KEY'),
+                aws_secret_access_key=os.getenv('WASABI_SECRET_KEY')
+            )
+        
+        logger.info(f"Checking for video at bucket path: {bucket_path}")
+        
+        # First check if file already exists locally
+        if os.path.exists(local_path):
+            # Validate the local file
+            file_size = os.path.getsize(local_path)
+            if file_size > 0:
+                logger.info(f"Video already exists locally at {local_path} ({file_size:,} bytes), skipping download")
+                input_path = local_path
+            else:
+                logger.warning(f"Local file {local_path} exists but is empty ({file_size} bytes), re-downloading")
+                os.remove(local_path)  # Remove empty file
+                # Proceed to download section below
+                local_exists = False
+        else:
+            local_exists = False
+            
+        # Download if file doesn't exist locally or was invalid
+        if not os.path.exists(local_path):
+            # File doesn't exist locally, proceed with download
+            logger.info(f"Video not found locally, downloading {bucket_path} from bucket {storage_bucket} to {local_path}")
+            
+            try:
+                # Download the file
+                s3.download_file(storage_bucket, bucket_path, local_path)
+                
+                # Validate downloaded file
+                downloaded_size = os.path.getsize(local_path)
+                logger.info(f"Successfully downloaded {bucket_path} to {local_path} ({downloaded_size:,} bytes)")
+                input_path = local_path
+            except Exception as e:
+                logger.error(f"Failed to download {bucket_path} from {storage_bucket}: {e}")
+                raise
+        
+        # Basic validation of video file and get duration
+        try:
+            import cv2
+            import math
+            # Try to open video file to verify it's valid
+            cap = cv2.VideoCapture(input_path)
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open video file: {input_path}")
+            
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            video_duration = frame_count / fps if fps > 0 else 0
+            cap.release()
+            
+            if frame_count <= 0:
+                raise ValueError(f"Video file appears to be empty or corrupted: {input_path}")
+                
+            logger.info(f"Video validation successful: {frame_count} frames, {fps:.2f} FPS, duration: {video_duration:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Video file validation failed for {input_path}: {e}")
+            # If local file is invalid, try to re-download
+            if os.path.exists(local_path):
+                os.remove(local_path)
+                logger.info("Removed invalid local file, please retry the task")
+            raise ValueError(f"Invalid video file: {e}")
+        # Download external SRT if provided
+        if external_srt_url:
+            try:
+                import urllib.request
+                from urllib.parse import urlparse
+
+                srt_fname = os.path.basename(urlparse(external_srt_url).path) or 'external_subtitles.srt'
+                external_srt_local_path = os.path.join(input_dir, srt_fname)
+                if not os.path.exists(external_srt_local_path):
+                    logger.info(f"Downloading external SRT from {external_srt_url} to {external_srt_local_path}")
+                    urllib.request.urlretrieve(external_srt_url, external_srt_local_path)
+                    logger.info(f"Downloaded external SRT to {external_srt_local_path}")
+                else:
+                    logger.info(f"External SRT already exists locally: {external_srt_local_path}")
+            except Exception as e:
+                logger.error(f"Failed to download external SRT from {external_srt_url}: {e}")
+                external_srt_local_path = None
+
+
+
+        # --- Celebrity/Object detection pipeline: run BEFORE processor config/init ---
+        celebrity_result_path = None
+        reference_search_result = None
+
+        if celebrity_detection or object_detection:
+            logger.info("Detection enabled (celebrity or object), sending job to Ada server.")
+
+            ada_api_url = "http://stream.gizmott.com:8000/api/celebrity-face-detection"
+            payload = {
+                "video_key": input_path,
+                "fps": 1,
+                "storage_bucket": storage_bucket,
+                "celebrity_detection": celebrity_detection,
+                "object_detection": object_detection,
+            }
+
+            # 1️⃣ Trigger Ada pipeline
+            response = requests.post(ada_api_url, json=payload, timeout=30)
+            response.raise_for_status()
+            job_info = response.json()
+
+            job_id = job_info["job_id"]
+            logger.info(f"Ada job triggered: {job_id}")
+
+            blackwell_task_id = self.request.id
+
+            # 2️⃣ Store job reference
+            redis_client.set(
+                f"task:{blackwell_task_id}",
+                json.dumps({
+                    "status": "PENDING",
+                    "ada_job_id": job_id,
+                    "created_at": datetime.now().isoformat(),
+                })
+            )
+
+            # 3️⃣ Poll pipeline job
+            status_url = f"http://stream.gizmott.com:8000/celebrity-jobs/{job_id}"
+            max_wait_seconds = 1800
+            poll_interval = 5
+            elapsed = 0
+
+            while elapsed < max_wait_seconds:
+                r = requests.get(status_url, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+
+                logger.info(f"Pipeline job status: {data}")
+
+                if data["status"] == "SUCCESS":
+                    result_info = data["result"]
+                    break
+
+                if data["status"] == "FAILURE":
+                    raise RuntimeError("Ada pipeline failed")
+
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+            else:
+                raise TimeoutError("Timed out waiting for Ada pipeline")
+
+            # 4️⃣ Download pipeline result.json
+            bucket = result_info["video_bucket"]
+            key = result_info["result_key"]
+
+            celebrity_result_path = f"/app/output/celebrity_results/{job_id}.json"
+            os.makedirs(os.path.dirname(celebrity_result_path), exist_ok=True)
+
+            logger.info(f"Downloading pipeline result {key} → {celebrity_result_path}")
+            s3.download_file(bucket, key, celebrity_result_path)
+
+            task_data["celebrity_result_path"] = celebrity_result_path
+
+            if "processor" in locals() and hasattr(processor, "config"):
+                processor.config["celebrity_index_path"] = celebrity_result_path
+
+            logger.info("Celebrity/Object detection completed")
+
+            # ==================================================================
+            # 🔍 Reference Image Search (OPTIONAL)
+            # ==================================================================
+            if reference_image_path:
+                logger.info("Triggering reference image search on Ada")
+
+                reference_api_url = "http://stream.gizmott.com:8000/api/reference-search"
+                ref_payload = {
+                    "ada_job_id": job_id,
+                    "reference_image_path": reference_image_path,
+                    "similarity_threshold": 0.67,
+                    "fps": 1,
+                    "storage_bucket": storage_bucket
+                }
+                
+                logger.info(f"Reference search payload: {ref_payload}")
+                ref_response = requests.post(reference_api_url, json=ref_payload, timeout=30)
+                ref_response.raise_for_status()
+                ref_job_id = ref_response.json()["job_id"]
+
+                ref_status_url = f"http://stream.gizmott.com:8000/celebrity-jobs/{ref_job_id}"
+                elapsed = 0
+
+                while elapsed < max_wait_seconds:
+                    r = requests.get(ref_status_url, timeout=(3, 60))
+                    r.raise_for_status()
+                    data = r.json()
+
+                    logger.info(f"Reference search status: {data}")
+
+                    if data["status"] == "SUCCESS":
+                        reference_search_result = data["result"]
+                        break
+
+                    if data["status"] == "FAILURE":
+                        raise RuntimeError("Reference image search failed")
+
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                else:
+                    raise TimeoutError("Timed out waiting for reference search")
+
+                # 🔑 Re-download UPDATED result.json
+                logger.info("Downloading updated result.json after reference search")
+                s3.download_file(bucket, key, celebrity_result_path)
+
+                task_data["reference_search_result"] = reference_search_result
+    
+
+        # --- Celebrity/Object detection pipeline: run BEFORE processor config/init ---
+        # celebrity_result_path = None
+        # if celebrity_detection or object_detection:
+        #     logger.info("Detection enabled (celebrity or object), sending job to Ada server.")
+
+        #     ada_api_url = "http://stream.gizmott.com:8000/api/celebrity-face-detection"
+        #     payload = {
+        #         "video_key": input_path,  # Use the validated input_path
+        #         "fps": 1,
+        #         'storage_bucket': storage_bucket,
+        #         'celebrity_detection': celebrity_detection,
+        #         'object_detection': object_detection
+        #     }
+
+        #     response = requests.post(ada_api_url, json=payload, timeout=30)
+        #     response.raise_for_status()
+        #     job_info = response.json()
+
+        #     logger.info(f"Response from ada api:{job_info}")
+
+        #     job_id = job_info["job_id"]
+        #     logger.info(f"Ada job triggered: {job_id}")
+        #     blackwell_task_id = self.request.id
+
+        #     # Store Ada job reference in Blackwell task
+        #     redis_client.set(
+        #         f"task:{blackwell_task_id}",
+        #         json.dumps({
+        #             "status": "PENDING",
+        #             "ada_job_id": job_id,
+        #             "created_at": datetime.now().isoformat()
+        #         })
+        #     )
+
+        #     # Poll Ada for status
+        #     status_url = f"http://stream.gizmott.com:8000/celebrity-jobs/{job_id}"
+        #     max_wait_seconds = 1800  # 30 minutes
+        #     poll_interval = 5
+        #     elapsed = 0
+
+        #     while elapsed < max_wait_seconds:
+        #         r = requests.get(status_url, timeout=10)
+        #         r.raise_for_status()
+        #         data = r.json()
+
+        #         logger.info(f"Data from celebrity jobs:{data}")
+
+        #         if data["status"] == "SUCCESS":
+        #             result_info = data["result"]
+        #             logger.info(f"Result info :{result_info}")
+        #             break
+
+        #         if data["status"] == "FAILURE":
+        #             raise RuntimeError("Ada celebrity job failed")
+
+        #         time.sleep(poll_interval)
+        #         elapsed += poll_interval
+        #     else:
+        #         raise TimeoutError("Timed out waiting for Ada job")
+
+        #     # Download result from Wasabi
+        #     bucket = result_info["video_bucket"]
+        #     key = result_info["result_key"]
+
+        #     celebrity_result_path = f"/app/output/celebrity_results/{job_id}.json"
+        #     os.makedirs(os.path.dirname(celebrity_result_path), exist_ok=True)
+
+        #     if not os.path.exists(celebrity_result_path):
+        #         logger.info(
+        #             f"Downloading celebrity result {key} from bucket {bucket} to {celebrity_result_path}"
+        #         )
+        #         s3.download_file(bucket, key, celebrity_result_path)
+
+        #     logger.info(f"Celebrity result downloaded: {celebrity_result_path}")
+
+        #     # Attach to task_data for downstream use
+        #     task_data["celebrity_result_path"] = celebrity_result_path
+        #     # Attach to Blackwell result
+        #     # result["celebrity_result_path"] = celebrity_result_path
+        #     # result["celebrity_result_bucket"] = bucket
+        #     # result["celebrity_result_key"] = key
+        #     # # Also update processor config for downstream use (if processor exists)
+        #     try:
+        #         if 'processor' in locals() and hasattr(processor, 'config'):
+        #             processor.config['celebrity_index_path'] = celebrity_result_path
+        #     except Exception as e:
+        #         logger.warning(f"Could not update processor config with celebrity_index_path: {e}")
+
+        #     #serialized_result = clean_for_serialization(result)
+
+        #     #logger.info(f"Serialized result ready from tasks {serialized_result}")
+        #     logger.info("Celebrity detection completed, path stored in task_data")
+            #return serialized_result
+
+        # Configure processor
+        config = {
+            'whisper_model': os.getenv('WHISPER_MODEL_SIZE', 'base'),
+            'target_short_duration': (min_duration, max_duration),
+            'aspect_ratio': content_aspect_ratio,  # Content aspect ratio for framing
+            'canvas_aspect_ratio': canvas_aspect_ratio,   # Canvas aspect ratio for output container
+            'max_shorts_per_video': no_of_videos,
+            'quality_threshold': float(os.getenv('QUALITY_THRESHOLD', '0.7')),
+            'smart_zoom_enabled': True,
+            'ollama_analysis_enabled': True,
+            'cleanup_temp_files': True,
+            'canvas_type': canvas_type  # Store canvas type for reference
+        }
+        
+        # Initialize processor
+        try:
+            # Check if we should use a custom config file
+            config_path = task_data.get('config_path')
+            if config_path and os.path.exists(config_path):
+                logger.info(f"Using custom config from {config_path}")
+                processor = VideoToShortsProcessor(config_path=config_path)
+            else:
+                # Check if default config exists
+                default_config_path = os.path.join(os.getcwd(), "config", "default_config.json")
+                if os.path.exists(default_config_path):
+                    logger.info(f"Using default config from {default_config_path}")
+                    processor = VideoToShortsProcessor(config_path=default_config_path)
+                else:
+                    logger.info("No config file found, using default settings")
+                    processor = VideoToShortsProcessor(config_path=None)
+            
+            # Apply task-specific settings that override the config
+            task_config = {
+                'whisper_model': os.getenv('WHISPER_MODEL_SIZE', 'base'),
+                'target_short_duration': (min_duration, max_duration),
+                'aspect_ratio': content_aspect_ratio,  # Content aspect ratio for framing
+                'canvas_aspect_ratio': canvas_aspect_ratio,    # Canvas aspect ratio for output container
+                'max_shorts_per_video': no_of_videos,
+                'no_of_videos': no_of_videos,  # Also set no_of_videos for linear cut mode
+                'quality_threshold': float(os.getenv('QUALITY_THRESHOLD', '0.7')),
+                'smart_zoom_enabled': True,
+                'ollama_analysis_enabled': True,
+                'cleanup_temp_files': True,
+                'canvas_type': canvas_type,  # Store canvas type for reference
+                'linear_cut': linear_cut,  # Pass linear cut flag
+                'linear_duration': linear_duration,  # Pass linear duration
+                'disable_smart_zoom_linear_cut': disable_smart_zoom_linear_cut,  # Pass smart zoom disable flag
+                'append_part_number': append_part_number,  # Pass part number flag
+                'subtitle_overlay': subtitle_overlay,  # Pass subtitle overlay flag
+                'subtitle_overlay_style_id': subtitle_overlay_style_id,  # Pass subtitle style ID
+                'api_style': api_style,  # Pass API-provided style object
+                'caption_x': caption_x,  # Pass caption X coordinate
+                'caption_y': caption_y,  # Pass caption Y coordinate
+                'kinetic_captions': kinetic_captions,  # Pass kinetic captions flag
+                'kinetic_mode': kinetic_mode,  # Pass kinetic mode
+                'final_video_ids': final_video_ids,  # Pass final_video_ids to processor
+                'user_prompt': user_prompt,  # Pass user prompt to processor
+                'llm_provider': llm_provider,  # Pass LLM provider preference
+                'ai_reframe': ai_reframe,  # Pass AI reframe flag
+                'enable_object_detection': enable_object_detection,  # Pass object detection flag
+                'intro_url': intro_url,  # Pass intro URL for downstream processing
+                'outro_url': outro_url,   # Pass outro URL for downstream processing
+                'celebrity_index_path': celebrity_result_path# Optional precomputed celebrity JSON path
+            }
+
+            # Update processor config with task-specific settings
+            processor.config.update(task_config)
+
+            # Ensure we have a valid config
+            if not processor.config:
+                logger.warning("Config is empty, using fallback defaults")
+                processor.config = task_config
+                
+            logger.info(f"Final processor configuration: {processor.config}")
+            
+            # Process video (run async function in sync context)
+            loop = asyncio.get_event_loop()
+            
+            # Initialize components first
+            loop.run_until_complete(processor.initialize_components())
+            
+            # Apply podcast template if specified
+            processed_input_path = input_path
+            if template == 'podcast':
+                logger.info(f"Podcast template specified - will be applied AFTER clipping for better performance")
+                # Note: Template processing moved to post-clipping stage in main processor
+                # This significantly improves performance by processing only the final clips
+                # instead of the entire source video
+            
+            # Process the video with intro/outro configuration if provided
+            intro_outro_config = None
+            if intro_url or outro_url:
+                intro_outro_config = {
+                    'intro_url': intro_url,
+                    'outro_url': outro_url,
+                    'storage_bucket': storage_bucket
+                }
+                logger.info(f"Passing intro/outro configuration to main processor")
+                logger.info(f"Intro URL: {intro_url}")
+                logger.info(f"Outro URL: {outro_url}")
+                logger.info(f"Storage: Wasabi (intro/outro always uses Wasabi)")
+                
+            result = loop.run_until_complete(processor.process_video(
+                processed_input_path, 
+                video_id=video_id,
+                uploaded_video_id=uploaded_video_id,
+                user_prompt=user_prompt, 
+                llm_provider=llm_provider, 
+                template=template,
+                intro_outro_config=intro_outro_config
+            ))
+        except Exception as e:
+            logger.error(f"Error initializing processor: {e}", exc_info=True)
+            raise
+        
+        # Cleanup
+        loop.run_until_complete(processor.cleanup())
+        
+        # Clean up temporary podcast file if created
+        if template == 'podcast' and processed_input_path != input_path:
+            try:
+                if os.path.exists(processed_input_path):
+                    os.remove(processed_input_path)
+                    logger.info(f"Cleaned up temporary podcast file: {processed_input_path}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary podcast file: {e}")
+        
+        # Note: Intro/outro processing is now handled inside the main video processor
+        # This ensures proper processing order: extract segment → apply intro/outro → apply smart zoom/templates
+        
+        # Apply brand logo overlay to processed videos if specified
+        if brand_logo and 'shorts_details' in result and result['shorts_details']:
+            logger.info(f"Applying brand logo overlay to {len(result['shorts_details'])} videos")
+            from src.utils.brand_logo_overlay import BrandLogoOverlay
+            
+            logo_overlay = BrandLogoOverlay()
+            
+            for short in result['shorts_details']:
+                try:
+                    output_path = short['output_path']
+                    if not os.path.exists(output_path):
+                        logger.warning(f"Output file not found for logo overlay: {output_path}")
+                        continue
+                    
+                    # Create temporary file for video with logo
+                    temp_output_path = output_path.replace('.mp4', '_with_logo.mp4')
+                    
+                    # Apply logo overlay
+                    logo_success = logo_overlay.add_logo_to_video(
+                        input_video_path=output_path,
+                        output_video_path=temp_output_path,
+                        logo_url=brand_logo,
+                        overlay_x=overlay_x,
+                        overlay_y=overlay_y,
+                        canvas_type=canvas_type
+                    )
+                    
+                    if logo_success and os.path.exists(temp_output_path):
+                        # Replace original with logo version
+                        import shutil
+                        shutil.move(temp_output_path, output_path)
+                        logger.info(f"Successfully applied brand logo to {os.path.basename(output_path)}")
+                    else:
+                        logger.warning(f"Failed to apply brand logo to {os.path.basename(output_path)}")
+                        # Clean up temp file if it exists
+                        if os.path.exists(temp_output_path):
+                            os.remove(temp_output_path)
+                
+                except Exception as e:
+                    logger.error(f"Error applying brand logo to {output_path}: {e}")
+                
+        # If an external SRT was provided, burn the subtitles into each generated short
+        if external_srt_local_path and 'shorts_details' in result and result['shorts_details']:
+            try:
+                from src.utils.subtitle_processor import SubtitleProcessor
+
+                sp = SubtitleProcessor()
+                logger.info(f"Applying external SRT subtitles from {external_srt_local_path} to generated shorts")
+
+                for short in result['shorts_details']:
+                    try:
+                        out_path = short.get('output_path')
+                        if not out_path or not os.path.exists(out_path):
+                            logger.warning(f"Short output not found for external SRT overlay: {out_path}")
+                            continue
+
+                        start_time = short.get('start_time', 0)
+                        end_time = short.get('end_time')
+                        if end_time is None:
+                            duration = short.get('duration', 0)
+                            end_time = start_time + duration
+
+                        temp_srt_output = out_path.replace('.mp4', '_srt.mp4')
+
+                        success = sp.add_subtitle_overlay_from_srt(
+                            input_video_path=out_path,
+                            output_video_path=temp_srt_output,
+                            external_srt_path=external_srt_local_path,
+                            segment_start_time=float(start_time or 0),
+                            segment_end_time=float(end_time or 0),
+                            style_id=subtitle_overlay_style_id,
+                            api_style=api_style,
+                            caption_x=caption_x,
+                            caption_y=caption_y,
+                            canvas_type=canvas_type
+                        )
+
+                        if success and os.path.exists(temp_srt_output):
+                            import shutil
+                            shutil.move(temp_srt_output, out_path)
+                            logger.info(f"Applied external SRT to {os.path.basename(out_path)}")
+                        else:
+                            logger.info(f"Output from add subtitle_overlay_from_srt: {success}")
+                            logger.warning(f"Failed to apply external SRT to {os.path.basename(out_path)}")
+
+                    except Exception as e:
+                        logger.error(f"Error applying external SRT to short {short.get('output_path')}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to apply external SRT to shorts: {e}")
+        # Upload results to the bucket
+        if 'shorts_details' in result and result['shorts_details']:
+            logger.info(f"Uploading {len(result['shorts_details'])} processed shorts to bucket {storage_bucket}")
+            
+            upload_results = []
+            
+            # 🎬 LINEAR CUT OPTIMIZATION: Generate title, description, and tags once for all segments
+            linear_cut_title = None
+            linear_cut_description = None
+            linear_cut_tags = None
+            
+            if linear_cut and result['shorts_details']:
+                # Check if titles are already generated by the main processor
+                first_short = result['shorts_details'][0]
+                
+                # Debug: log what we have in first_short
+                logger.info(f"🔍 DEBUG: Checking first_short for existing title")
+                logger.info(f"   title: {first_short.get('title', 'NOT FOUND')}")
+                logger.info(f"   title_generated: {first_short.get('title_generated', 'NOT FOUND')}")
+                logger.info(f"   description: {first_short.get('description', 'NOT FOUND')[:50] if first_short.get('description') else 'NOT FOUND'}...")
+                
+                # List of invalid/placeholder titles to reject
+                invalid_titles = [
+                    'web_search', 'internet_search', 'search', 'untitled', 
+                    'video clip', 'content', 'segment', 'part', 'video',
+                    'clip', 'unknown', 'none', 'n/a'
+                ]
+                
+                existing_title = first_short.get('title', '')
+                
+                # Remove "Part X of Y" suffix to get base title
+                import re
+                part_pattern = r'\s*-\s*Part\s+\d+\s+of\s+\d+\s*$'
+                base_title = re.sub(part_pattern, '', existing_title, flags=re.IGNORECASE).strip()
+                
+                # Check if title is valid (not empty and not in invalid list)
+                is_valid_title = (
+                    base_title and 
+                    base_title.lower() not in invalid_titles and
+                    len(base_title) > 3  # At least 4 characters
+                )
+                
+                logger.info(f"🔍 Title validation: base_title='{base_title}', is_valid={is_valid_title}")
+                
+                if is_valid_title:
+                    # Use the existing title from main processor
+                    linear_cut_title = base_title
+                    linear_cut_description = first_short.get('description', '')
+                    linear_cut_tags = first_short.get('tags', [])
+                    
+                    logger.info("🎬 LINEAR CUT MODE: Using existing title from main processor")
+                    logger.info(f"   Base Title: {linear_cut_title}")
+                    logger.info(f"   Base Description: {linear_cut_description}")
+                    logger.info(f"   Base Tags: {linear_cut_tags}")
+                    logger.info(f"   Will append 'Part X' to titles for {len(result['shorts_details'])} segments")
+                else:
+                    # Generate new title, description, and tags
+                    logger.info(f"🎬 LINEAR CUT MODE: Invalid/placeholder title detected ('{base_title}'), generating new title")
+                    
+                    segment_data = {
+                        'transcript': first_short.get('transcript', ''),
+                        'start_time': first_short.get('start_time', 0),
+                        'end_time': first_short.get('end_time', 0)
+                    }
+                    
+                    prompt_analysis = result.get('prompt_analysis', {})
+                    object_context = first_short.get('object_context', {})
+                    
+                    # Generate base title and description once
+                    linear_cut_title, linear_cut_description = generate_ai_title_and_description(
+                        segment_data, prompt_analysis
+                    )
+                    
+                    # Generate tags once for all segments
+                    linear_cut_tags = generate_tags_from_analysis(
+                        segment_data, prompt_analysis, object_context
+                    )
+                    
+                    logger.info(f"   Base Title: {linear_cut_title}")
+                    logger.info(f"   Base Description: {linear_cut_description}")
+                    logger.info(f"   Base Tags: {linear_cut_tags}")
+                    logger.info(f"   Will append 'Part X' to titles for {len(result['shorts_details'])} segments")
+            
+            # Track total clips for status update
+            total_clips = len(result['shorts_details'])
+            
+            for short in result['shorts_details']:
+                try:
+                    output_path = short['output_path']
+                    if not os.path.exists(output_path):
+                        logger.warning(f"Output file not found: {output_path}")
+                        continue
+                    
+                    # Determine S3 object key - use final_video_ids if available
+                    short_index = result['shorts_details'].index(short)
+                    
+                    # Check if this is the last clip
+                    is_last_clip = (short_index == total_clips - 1)
+                    
+                    # Use provided final_video_ids or generate based on video_id
+                    final_video_ids = task_data.get('final_video_ids', [])
+                    base_name = os.path.basename(output_path)
+                    input_video_name = os.path.basename(input_path).split('.')[0]
+                    
+                    if short_index < len(final_video_ids) and final_video_ids[short_index]:
+                        # Include input video name in the object key
+                        object_key = f"ai-clips/{input_video_name}_{final_video_ids[short_index]}_{canvas_type}.mp4"
+                    else:
+                        object_key = f"ai-clips/{video_id}/{base_name}"
+                    
+                    logger.info(f"Uploading {output_path} to {object_key}")
+                    
+                    # Upload file to S3
+                    s3.upload_file(
+                        output_path, 
+                        storage_bucket, 
+                        object_key,
+                        ExtraArgs={'ContentType': 'video/mp4'}
+                    )
+                    
+                    # Add S3 URL to results
+                    # s3_url = f"https://s3.us-east-1.wasabisys.com/{object_key}"
+                    # short['s3_url'] = s3_url
+                    # upload_results.append({
+                    #     'file': os.path.basename(output_path),
+                    #     'object_key': object_key,
+                    #     's3_url': s3_url,
+                    #     'success': True
+                    # })
+                    
+                    # Generate thumbnail for the video
+                    thumbnail_path = None
+                    thumbnail_url = None
+                    try:
+                        logger.info(f"Generating thumbnail for {output_path}")
+                        thumbnail_path = generate_thumbnail(output_path)
+                        
+                        if thumbnail_path:
+                            # Upload thumbnail to API
+                            pubid = task_data.get('pubid')
+                            channelid = task_data.get('channelid')
+                            logger.info(f"Uploading thumbnail {thumbnail_path} with pubid {pubid} and channelid {channelid}")
+                            
+                            thumbnail_result = upload_thumbnail(thumbnail_path, pubid, channelid)
+                            
+                            if thumbnail_result.get('success'):
+                                thumbnail_url = thumbnail_result.get('thumbnail_url')
+                                logger.info(f"Successfully uploaded thumbnail, URL: {thumbnail_url}")
+                                # Add thumbnail URL to short details for reference
+                                short['thumbnail_url'] = thumbnail_url
+                            else:
+                                logger.error(f"Failed to upload thumbnail: {thumbnail_result.get('error')}")
+                        else:
+                            logger.warning(f"Failed to generate thumbnail for {output_path}")
+                    except Exception as e:
+                        logger.error(f"Error in thumbnail generation/upload: {e}")
+                    
+                    # Update clip via API instead of direct database insertion
+                    try:
+                        # Get necessary data
+                        # Always use final_video_ids for clip identification
+                        if short_index < len(final_video_ids):
+                            clip_id = final_video_ids[short_index]
+                            logger.info(f"Using final_video_id {clip_id} for short index {short_index}")
+                        else:
+                            # This should not happen if validation is correct
+                            logger.error(f"Short index {short_index} exceeds final_video_ids length {len(final_video_ids)}")
+                            raise ValueError(f"Missing final_video_id for short index {short_index}")
+                        
+                        pubid = task_data.get('pubid')
+                        channelid = task_data.get('channelid')
+                        
+                        # Extract both video identifiers for clip creation
+                        clip_video_id = task_data.get('video_id')
+                        clip_uploaded_video_id = task_data.get('uploaded_video_id')
+                            
+                        if not pubid:
+                            logger.warning(f"No pubid available, skipping API update for clip {clip_id}")
+                            continue
+                        
+                        if not channelid:
+                            logger.warning(f"No channelid available, skipping API update for clip {clip_id}")
+                            continue
+                        
+                        # Extract duration from short details
+                        duration = short.get('duration', 0)
+                        if not duration and 'start_time' in short and 'end_time' in short:
+                            duration = short['end_time'] - short['start_time']
+                        
+                        # 🎬 LINEAR CUT MODE: Use pre-generated title, description, and tags with part numbers
+                        if linear_cut and linear_cut_title and linear_cut_description:
+                            # Calculate part number (1-indexed)
+                            part_number = short_index + 1
+                            
+                            # Append part number to base title
+                            ai_title = f"{linear_cut_title} - Part {part_number}"
+                            
+                            # Use same description for all parts
+                            ai_description = linear_cut_description
+                            
+                            # Use same tags for all parts
+                            tags = linear_cut_tags if linear_cut_tags else []
+                            
+                            logger.info(f"🎬 LINEAR CUT: Using optimized title for part {part_number}: {ai_title}")
+                            logger.info(f"🎬 LINEAR CUT: Using optimized tags: {tags}")
+                        else:
+                            # Standard mode: Use already generated AI title and description from main processing
+                            ai_title = short.get('title', '')
+                            ai_description = short.get('description', '')
+                            
+                            # Prepare segment data for fallback and tags generation
+                            segment_data = {
+                                'transcript': short.get('transcript', ''),
+                                'start_time': short.get('start_time', 0),
+                                'end_time': short.get('end_time', 0)
+                            }
+                            
+                            # Get prompt analysis if available from result
+                            prompt_analysis = result.get('prompt_analysis', {})
+                            
+                            # Fallback to generating new title/description if not available
+                            if not ai_title or not ai_description:
+                                logger.warning(f"Title or description missing for clip {clip_id}, generating fallback")
+                                
+                                fallback_title, fallback_description = generate_ai_title_and_description(
+                                    segment_data, prompt_analysis
+                                )
+                                
+                                if not ai_title:
+                                    ai_title = fallback_title
+                                if not ai_description:
+                                    ai_description = fallback_description
+                            
+                            logger.info(f"Using AI title for clip {clip_id}: {ai_title}")
+                            logger.info(f"Using AI description for clip {clip_id}: {ai_description}")
+                            
+                            # Generate tags from analysis (standard mode)
+                            object_context = short.get('object_context', {})
+                            tags = generate_tags_from_analysis(
+                                segment_data, prompt_analysis, object_context
+                            )
+                        
+                        # Create clip data
+                        clip_data = create_clip_data(
+                            key=object_key,
+                            thumbnail=thumbnail_url or "",
+                            ai_title=ai_title,
+                            ai_description=ai_description,
+                            tags=tags,
+                            clip_id=clip_id,
+                            duration=duration,
+                            video_id=clip_video_id,
+                            uploaded_video_id=clip_uploaded_video_id,
+                            brand_logo=brand_logo,
+                            overlay_x=overlay_x,
+                            overlay_y=overlay_y,
+                            canvas_type=canvas_type
+                        )
+                        
+                        # Determine if we should add status (only for last clip in linear cut mode)
+                        api_status = None
+                        if linear_cut and is_last_clip:
+                            api_status = "completed"
+                            logger.info(f"📍 Last clip in linear cut mode - adding status='completed' to API request body")
+                        
+                        # Update clip via API
+                        logger.info(f"Updating clip {clip_id} via API with key {object_key}")
+                        api_result = db_api_client.update_single_clip(clip_data, pubid, channelid, status=api_status)
+                        
+                        if api_result.get('success', True):  # Assume success if no explicit success field
+                            logger.info(f"Successfully updated clip {clip_id} via API")
+                            if thumbnail_url:
+                                logger.info(f"Added thumbnail URL {thumbnail_url} for clip {clip_id}")
+                        else:
+                            logger.error(f"Failed to update clip {clip_id} via API: {api_result.get('error', 'Unknown error')}")
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to update clip via API: {e}")
+                    
+                    logger.info(f"Successfully uploaded {output_path} to {object_key}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to upload {short.get('output_path')}: {e}")
+                    upload_results.append({
+                        'file': os.path.basename(short.get('output_path', '')),
+                        'error': str(e),
+                        'success': False
+                    })
+            
+            # Add upload results to the final result
+            result['upload_results'] = upload_results
+            
+            if all(r.get('success', False) for r in upload_results):
+                logger.info(f"All {len(upload_results)} videos successfully uploaded")
+            else:
+                successful = sum(1 for r in upload_results if r.get('success', False))
+                logger.warning(f"Only {successful}/{len(upload_results)} videos successfully uploaded")
+        else:
+            logger.warning("No shorts details found in result, skipping upload")
+        
+        # Store task ID in the result
+        result['task_id'] = self.request.id
+        result['video_id'] = video_id
+        result['uploaded_video_id'] = uploaded_video_id
+        result['effective_id'] = effective_id
+        result['celebrity_result_path'] = celebrity_result_path
+        
+        logger.info(f"Video processing task completed: {id_label}")
+        serialized_result = clean_for_serialization(result)
+        return serialized_result
+
+        # if task_data.get("celebrity_detection"):
+        #     logger.info(f"Celebrity detection was enabled for this task.")
+
+        #     celeb_task = process_celebrity_face_detection.apply_async(
+        #     args=[processed_input_path, 1, "output/celeb_results.json", "/tmp/videos"]
+        # )
+
+
+
+        # if task_data.get("celebrity_detection"):
+        #     logger.info("Celebrity detection enabled, sending job to Ada server.")
+
+        #     ada_api_url = "http://stream.gizmott.com:8000/api/celebrity-face-detection"
+        #     payload = {
+        #         "video_key": processed_input_path,
+        #         "fps": 1,
+        #         'storage_bucket': storage_bucket
+        #     }
+
+        #     response = requests.post(ada_api_url, json=payload, timeout=30)
+        #     response.raise_for_status()
+        #     job_info = response.json()
+
+        #     logger.info(f"Response from ada api:{job_info}")
+
+        #     job_id = job_info["job_id"]
+        #     logger.info(f"Ada job triggered: {job_id}")
+        #     blackwell_task_id = self.request.id
+
+        #     # Store Ada job reference in Blackwell task
+        #     redis_client.set(
+        #         f"task:{blackwell_task_id}",
+        #         json.dumps({
+        #             "status": "PENDING",
+        #             "ada_job_id": job_id,
+        #             "created_at": datetime.now().isoformat()
+        #         })
+        #     )
+
+        #     result["celebrity_face_detection_job_id"] = job_id
+
+
+        # # ---------------- Poll Ada for status ----------------
+
+        # status_url = f"http://stream.gizmott.com:8000/celebrity-jobs/{job_id}"
+        # max_wait_seconds = 1800  # 30 minutes
+        # poll_interval = 5
+        # elapsed = 0
+
+        # while elapsed < max_wait_seconds:
+        #     r = requests.get(status_url, timeout=10)
+        #     r.raise_for_status()
+        #     data = r.json()
+
+        #     logger.info(f"Data from celebrity jobs:{data}")
+
+        #     if data["status"] == "SUCCESS":
+        #         result_info = data["result"]
+        #         logger.info(f"Result info :{result_info}")
+        #         break
+
+        #     if data["status"] == "FAILURE":
+        #         raise RuntimeError("Ada celebrity job failed")
+
+        #     time.sleep(poll_interval)
+        #     elapsed += poll_interval
+        # else:
+        #     raise TimeoutError("Timed out waiting for Ada job")
+
+
+        # # ---------------- Download result from Wasabi ----------------
+
+        # # bucket = job_info["video_bucket"]
+        # # key = job_info["result_key"]
+        # # result_url= job_info["result_url"]
+
+        # bucket = result_info["video_bucket"]      # From tasks.py return
+        # key = result_info["result_key"]           # From tasks.py return
+
+
+        # local_result_path = f"/app/output/celebrity_results/{job_id}.json"
+        # os.makedirs(os.path.dirname(local_result_path), exist_ok=True)
+
+        # if not os.path.exists(local_result_path):
+        #     logger.info(
+        #         f"Downloading celebrity result {key} from bucket {bucket} to {local_result_path}"
+        #     )
+        #     s3.download_file(bucket, key, local_result_path)
+
+        # logger.info(f"Celebrity result downloaded: {local_result_path}")
+
+        # # Attach to Blackwell result
+        # result["celebrity_result_path"] = local_result_path
+        # result["celebrity_result_bucket"] = bucket
+        # result["celebrity_result_key"] = key
+        # # Also update processor config for downstream use (if processor exists)
+        # try:
+        #     if 'processor' in locals() and hasattr(processor, 'config'):
+        #         processor.config['celebrity_index_path'] = local_result_path
+        # except Exception as e:
+        #     logger.warning(f"Could not update processor config with celebrity_index_path: {e}")
+
+        # serialized_result = clean_for_serialization(result)
+
+        # logger.info(f"Serialized result ready from tasks {serialized_result}")
+        # return serialized_result
+
+    
+    
+    except Exception as e:
+        logger.error(f"Error processing video: {e}", exc_info=True)
+        error_result = {
+            'status': 'error',
+            'video_id': task_data.get('video_id'),
+            'task_id': self.request.id,
+            'error': str(e)
+        }
+        # Clean error result for JSON serialization (handles both dataclasses and NumPy types)
+        return clean_for_serialization(error_result)
+
+
+# ...new updated code
+# @shared_task(
+#     bind=True,
+#     name="process_celebrity_face_detection",
+#     autoretry_for=(Exception,),
+#     retry_backoff=True,
+#     retry_kwargs={'max_retries': 3},
+#     acks_late=True
+# )
+# def process_celebrity_face_detection(self, video_url, fps=1, output_json="output/results.json", download_path="/tmp/videos"):
+#     """
+#     Celery GPU Task: Download video, run pipeline, return result.
+#     """
+#     start = time()
+#     logger.info(f"Starting celebrity face detection task: {self.request.id}")
+#     logger.info(f"[task-{self.request.id}] Starting: {video_url}")
+
+#     Path(download_path).mkdir(parents=True, exist_ok=True)
+
+#     # try:
+#     #     # Remote URL? Download it.
+#     #     if video_url.startswith("http://") or video_url.startswith("https://"):
+#     #         import requests
+#     #         local_fname = os.path.join(download_path, f"{self.request.id}.mp4")
+#     #         logger.info(f"[task-{self.request.id}] Downloading → {local_fname}")
+
+#     #         with requests.get(video_url, stream=True, timeout=60) as r:
+#     #             r.raise_for_status()
+#     #             with open(local_fname, "wb") as f:
+#     #                 for chunk in r.iter_content(8192):
+#     #                     f.write(chunk)
+#     #         video_path = local_fname
+#     #     else:
+#     #         video_path = video_url  # already local
+
+#     try:
+#         if not os.path.exists(video_url):
+#             logger.error(f"Video file does not exist: {video_url}")
+#             raise FileNotFoundError(f"Video file not found: {video_url}")
+
+#         # Run pipeline
+#         # prepare_gpu()  # Uncomment if you have this function
+#         result = run_pipeline(
+#             video_url,
+#             fps=fps,
+#             output_json=output_json,
+#         )
+
+#         elapsed = time() - start
+#         logger.info(f"[task-{self.request.id}] Completed in {elapsed:.1f}s")
+
+#         return {"status": "success", "task_id": self.request.id, "result": result}
+
+#     except Exception as exc:
+#         logger.exception(f"[task-{self.request.id}] ERROR: {exc}")
+#         raise
+
+
+
+@task_prerun.connect
+def task_prerun_handler(task_id, task, *args, **kwargs):
+    """Handler called before a task is run."""
+    logger.info(f"0.1 Starting task {task.name}[{task_id}]")
+    
+    # Update Redis with task status
+    try:
+        task_data_str = redis_client.get(f"task:{task_id}")
+        if task_data_str:
+            task_data = json.loads(task_data_str)
+            task_data["status"] = "STARTED"
+            task_data["started_at"] = datetime.now().isoformat()
+            redis_client.set(f"task:{task_id}", json.dumps(task_data))
+            logger.info(f"0.2 Updated Redis task status to STARTED for {task_id} with key task:{task_id}")
+    except Exception as e:
+        logger.error(f"0.3 Failed to update Redis for task start: {e}")
+
+
+
+@task_postrun.connect
+def task_postrun_handler(task_id, task, *args, retval=None, state=None, **kwargs):
+    """Handler called after a task is run."""
+    logger.info(f"Task {task.name}[{task_id}] completed with state: {state}")
+    logger.info(f"Task postrun handler called for {task.name}[{task_id}] for redis storage with return value:  {retval}")
+    
+    # Update Redis with task status
+    try:
+        logger.info(f"1.1 Before updating Redis for task {task_id} with state {state}")
+        #task_data_str = redis_client.get(f"task:{task_id}")
+        task_data_str = redis_client.get(f"result:{task_id}")
+        logger.info(f"1.2 Retrieved task data from Redis for task {task_id}: {task_data_str}")
+        if task_data_str:
+            task_data = json.loads(task_data_str)
+            task_data["status"] = state
+            task_data["completed_at"] = datetime.now().isoformat()
+            redis_client.set(f"task:{task_id}", json.dumps(task_data))
+            logger.info(f"1.3 Updated Redis task status to {state} for {task_id} with key task:{task_id}")
+    except Exception as e:
+        logger.error(f"1.4 Failed to update Redis for task completion: {e}")
+
+
+
+@task_success.connect
+def task_success_handler(sender=None, result=None, **kwargs):
+    """Handler called when a task succeeds."""
+    task_id = sender.request.id
+    logger.info(f"2.1 Task {sender.name}[{task_id}] after success (2): {result}")
+    logger.info(f"2.2 Task {sender.name}[{task_id}] succeeded")
+    
+    # Store result in Redis
+    try:
+        if result:
+            result_data = {
+                "result": result,
+                "status": "SUCCESS"
+            }
+            redis_client.set(f"result:{task_id}", json.dumps(result_data))
+            logger.info(f"2.3 Stored successful result in Redis for {task_id} {sender.name} under the key result:{task_id}")
+    except Exception as e:
+        logger.error(f"2.4 Failed to store successful result in Redis: {e}")
+
+
+
+@task_failure.connect
+def task_failure_handler(sender=None, task_id=None, exception=None, **kwargs):
+    """Handler called when a task fails."""
+    logger.error(f"3.1 Task {sender.name}[{task_id}] failed: {exception}")
+    
+    # Store error in Redis
+    try:
+        result_data = {
+            "error": str(exception),
+            "status": "FAILURE"
+        }
+        redis_client.set(f"result:{task_id}", json.dumps(result_data))
+        logger.info(f"3.2 Stored failure result in Redis for {task_id}")
+    except Exception as e:
+        logger.error(f"3.3 Failed to store failure result in Redis: {e}")

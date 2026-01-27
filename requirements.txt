@@ -1,0 +1,83 @@
+# Core Dependencies
+torch>=2.7.0,<3.0.0
+torchvision>=0.20.0,<1.0.0
+torchaudio>=2.7.0,<3.0.0
+
+# Computer Vision
+opencv-python>=4.8.0,<5.0.0
+mediapipe>=0.10.0,<1.0.0
+ultralytics>=8.0.0,<9.0.0
+
+# Audio Processing - Using whisper-timestamped for precise word-level timestamps
+whisper-timestamped>=1.15.0
+dtw-python>=1.4.0
+onnxruntime>=1.16.0
+soundfile>=0.12.0,<1.0.0
+librosa>=0.10.0,<1.0.0
+# openai-whisper>=20230918  # Replaced by whisper-timestamped
+
+# Video Processing
+ffmpeg-python>=0.2.0,<1.0.0
+moviepy>=1.0.3,<2.0.0
+
+# AI Integration
+aiohttp>=3.8.0,<4.0.0
+httpx>=0.24.0,<1.0.0
+pydantic>=2.0.0,<3.0.0
+
+# Image Processing
+Pillow>=10.0.0,<11.0.0
+scikit-image>=0.21.0,<1.0.0
+
+# Data Science
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+scipy>=1.11.0,<2.0.0
+
+# Utilities
+tqdm>=4.65.0,<5.0.0
+click>=8.1.0,<9.0.0
+python-dotenv>=1.0.0,<2.0.0
+pyyaml>=6.0.0,<7.0.0
+colorama>=0.4.6,<1.0.0
+psutil>=5.9.0,<6.0.0
+
+# Logging and Monitoring
+rich>=13.0.0,<14.0.0
+structlog>=23.0.0,<24.0.0
+
+# Async Processing
+asyncio-mqtt>=0.16.0,<1.0.0
+aiofiles>=23.0.0,<24.0.0
+
+# Queue System
+celery>=5.3.0,<6.0.0
+redis>=5.0.0,<6.0.0
+
+# Database
+psycopg2-binary>=2.9.6,<3.0.0
+
+# Storage
+boto3>=1.28.0,<2.0.0
+
+# API Framework
+fastapi>=0.103.0,<1.0.0
+uvicorn>=0.23.0,<1.0.0
+pydantic>=2.0.0,<3.0.0
+
+# Development Tools (optional)
+pytest>=7.4.0,<8.0.0
+black>=23.0.0,<24.0.0
+isort>=5.12.0,<6.0.0
+flake8>=6.0.0,<7.0.0
+mypy>=1.5.0,<2.0.0
+
+# Optional: For advanced features
+# transformers>=4.30.0,<5.0.0  # For custom models
+# accelerate>=0.20.0,<1.0.0    # For model acceleration
+# datasets>=2.13.0,<3.0.0      # For data loading
+
+
+insightface
+onnxruntime
+onnxruntime-gpu

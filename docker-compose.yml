@@ -1,0 +1,453 @@
+# # # Remove version: '3.8' (obsolete warning)
+# # services:
+# #   # API service (unchanged)
+# #   api:
+# #     build:
+# #       context: .
+# #       dockerfile: Dockerfile
+# #     ports:
+# #       - "2002:8000"
+# #     volumes:
+# #       - .:/app
+# #       - ./input:/app/input
+# #       - ./output:/app/output
+# #       - ./cache:/app/cache
+# #       - ./models:/app/models
+# #       - ./temp:/app/temp
+# #     command: python -m src.api.app
+# #     environment:
+# #       - REDIS_HOST=redis
+# #       - REDIS_PORT=6379
+# #       - REDIS_PASSWORD=redis123
+# #       - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+# #       - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+# #       - API_HOST=0.0.0.0
+# #       - API_PORT=8000
+# #     depends_on:
+# #       - redis
+# #     restart: always
+
+# #   # Celery worker - CRITICAL FIXES APPLIED
+# #   worker:
+# #     build:
+# #       context: .
+# #       dockerfile: Dockerfile
+# #     volumes:
+# #       - .:/app
+# #       - ./input:/app/input
+# #       - ./output:/app/output
+# #       - ./cache:/app/cache
+# #       - ./models:/app/models
+# #       - ./temp:/app/temp
+# #     # 🔴 CRITICAL: Solo pool + low concurrency = NO FORKING = NO SIGSEGV
+# #     command: >
+# #       celery -A src.queue_system.celery_app worker \
+# #       --loglevel=info \
+# #       --queues=video_processing,celery \
+# #       --pool=solo \
+# #       --concurrency=1 \
+# #     #--prefetch-multiplier=1
+# #     environment:
+# #       - REDIS_HOST=redis
+# #       - REDIS_PORT=6379
+# #       - REDIS_PASSWORD=redis123
+# #       - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+# #       - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+# #       - WASABI_ACCESS_KEY=${WASABI_ACCESS_KEY}
+# #       - WASABI_SECRET_KEY=${WASABI_SECRET_KEY}
+# #       - WASABI_ENDPOINT=https://s3.us-east-1.wasabisys.com
+# #       - S3_BUCKET_NAME=redeem-tv
+# #       - CUDA_VISIBLE_DEVICES=0
+# #       #- PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+# #       - PYTORCH_ALLOC_CONF=max_split_size_mb:512  # 🟡 Added for PyTorch 2.x
+# #       - USE_CUDA=1
+# #       - WHISPER_DEVICE=cuda
+# #       - OLLAMA_BASE_URL=127.0.0.1:11434  # Fixed spacing
+# #       - NVIDIA_VISIBLE_DEVICES=all
+# #       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+# #     runtime: nvidia  
+# #     depends_on:
+# #       - redis
+# #     restart: always
+# #     deploy:
+# #       resources:
+# #         limits:
+# #           memory: 16G  # 🟡 Prevent OOM
+# #           cpus: '4.0'  # 🟡 CPU limit
+# #         reservations:
+# #           devices:
+# #             - driver: nvidia
+# #               count: 1
+# #               capabilities: [gpu]
+# #               #capabilities: [compute,utility]  # More explicit
+# #     extra_hosts:
+# #       - "host.docker.internal:host-gateway"
+      
+# #   # Redis server (unchanged)
+# #   redis:
+# #     image: redis:7
+# #     command: redis-server --requirepass redis123
+# #     ports:
+# #       - "6382:6379"
+# #     volumes:
+# #       - redis-data:/data
+# #     restart: always
+
+# # volumes:
+# #   redis-data:
+
+
+# # Entire original docker-compose.yml commented out for reference
+
+
+# # version: '3.8'
+# updated on 09-12-2025
+# services:
+#   # API service
+#   api:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     ports:
+#       - "2002:8000"
+#     volumes:
+#       - .:/app
+#       - ./input:/app/input
+#       - ./output:/app/output
+#       - ./cache:/app/cache
+#       - ./models:/app/models
+#       - ./temp:/app/temp
+#     command: python -m src.api.app
+#     environment:
+#       - REDIS_HOST=redis
+#       - REDIS_PORT=6379
+#       - REDIS_PASSWORD=redis123
+#       - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+#       - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+#       - API_HOST=0.0.0.0
+#       - API_PORT=8000
+#     depends_on:
+#       - redis
+#     restart: always
+
+#   # Celery worker for video processing
+#   worker:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     volumes:
+#       - .:/app
+#       - ./input:/app/input
+#       - ./output:/app/output
+#       - ./cache:/app/cache
+#       - ./models:/app/models
+#       - ./temp:/app/temp
+#     # command: >
+#     #   celery -A src.queue_system.celery_app worker --loglevel=info --queues=video_processing,celery \
+#     #   -- pool=solo \
+#     #   -- concurrency=1
+#     command:
+#         - celery
+#         - -A
+#         - src.queue_system.celery_app
+#         - worker
+#         - --loglevel=info
+#         - --queues=video_processing,celery
+#         - --pool=solo
+#         - --concurrency=1
+#     environment:
+#       - REDIS_HOST=redis
+#       - REDIS_PORT=6379
+#       - REDIS_PASSWORD=redis123
+#       - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+#       - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+#       - WASABI_ACCESS_KEY=${WASABI_ACCESS_KEY}
+#       - WASABI_SECRET_KEY=${WASABI_SECRET_KEY}
+#       - WASABI_ENDPOINT=https://s3.us-east-1.wasabisys.com
+#       - S3_BUCKET_NAME=redeem-tv
+#       - CUDA_VISIBLE_DEVICES=0
+#       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+#       - USE_CUDA=1
+#       - WHISPER_DEVICE=cuda
+#       - OLLAMA_BASE_URL=127.0.0.1:11434/
+#       #- OLLAMA_BASE_URL=http://ollama:11434/  # Connect to the ollama service
+
+#       - NVIDIA_VISIBLE_DEVICES=all
+#       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+#     runtime: nvidia  
+#     depends_on:
+#       - redis
+#       # - ollama  # Add dependency on ollama service
+#     restart: always
+#     deploy:
+#       resources:
+#         reservations:
+#           devices:
+#             - driver: nvidia
+#               count: 1
+#               capabilities: [gpu]
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+              
+#   # Redis server
+#   redis:
+#     #image: redis:7
+#     image: redis:7-alpine
+#     #command: redis-server --requirepass redis123
+#     command: sh -c "echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf && sysctl -p && redis-server --requirepass redis123 --appendonly yes"
+#     ports:
+#       - "6382:6379"
+#     volumes:
+#       - redis-data:/data
+#     restart: always
+
+# #   # Add Ollama as a service
+# #   # ollama:
+# #   #   image: ollama/ollama:latest
+# #   #   volumes:
+# #   #     - ollama-data:/root/.ollama
+# #   #   ports:
+# #   #     - "127.0.0.1:11435:11434"  # Only exposed to localhost
+# #   #   restart: always
+# #   #   environment:
+# #   #     - OLLAMA_KEEP_ALIVE=999h  # Keep models loaded in memory
+# #   #     - CUDA_VISIBLE_DEVICES=0  # Use GPU 1 (second GPU)
+# #   #     - OLLAMA_NUM_GPU=999  # Force all layers to GPU
+# #   #   # Pull and run the model on startup
+# #   #   entrypoint: ["/bin/bash", "-c"]
+# #   #   command: 
+# #   #     - |
+# #   #       # Start ollama serve in the background
+# #   #       ollama serve &
+# #   #       # Wait for ollama to be ready
+# #   #       sleep 5
+# #   #       # Pull and run the model with keepalive
+# #   #       ollama pull mistral-small3.2:latest
+# #   #       ollama run mistral-small3.2:latest --keepalive 9999h &
+# #   #       # Keep the container running
+# #   #       wait
+# #   #   deploy:
+# #   #     resources:
+# #   #       reservations:
+# #   #         devices:
+# #   #           - driver: nvidia
+# #   #             capabilities: [gpu]
+
+# volumes:
+#   redis-data:
+#   # ollama-data:  # Add volume for ollama data
+
+
+
+# updated on 08-12-2025
+# services:
+#   api:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     ports:
+#       - "2002:8000"
+#     volumes:
+#       - ./input:/app/input
+#       - ./output:/app/output
+#       - ./cache:/app/cache
+#       - ./models:/app/models
+#       - ./temp:/app/temp
+#     command: python -m src.api.app
+#     environment:
+#       - REDIS_HOST=redis
+#       - REDIS_PORT=6379
+#       - REDIS_PASSWORD=redis123
+#       - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+#       - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+#       - API_HOST=0.0.0.0
+#       - API_PORT=8000
+#       - NVIDIA_VISIBLE_DEVICES=all
+#     depends_on:
+#       - redis
+#     restart: always
+#     runtime: nvidia
+#     deploy:
+#       resources:
+#         reservations:
+#           devices:
+#             - driver: nvidia
+#               count: 1
+#               capabilities: [gpu]
+
+#   worker:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     volumes:
+#       - ./input:/app/input
+#       - ./output:/app/output
+#       - ./cache:/app/cache
+#       - ./models:/app/models
+#       - ./temp:/app/temp
+#     command:
+#       - celery
+#       - -A
+#       - src.queue_system.celery_app
+#       - worker
+#       - --loglevel=info
+#       - --queues=video_processing,celery
+#       - --pool=solo
+#       - --concurrency=1
+#     environment:
+#       - REDIS_HOST=redis
+#       - REDIS_PORT=6379
+#       - REDIS_PASSWORD=redis123
+#       - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+#       - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+#       - WASABI_ACCESS_KEY=${WASABI_ACCESS_KEY}
+#       - WASABI_SECRET_KEY=${WASABI_SECRET_KEY}
+#       - WASABI_ENDPOINT=https://s3.us-east-1.wasabisys.com
+#       - S3_BUCKET_NAME=redeem-tv
+#       - CUDA_VISIBLE_DEVICES=0
+#       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+#       - USE_CUDA=1
+#       - WHISPER_DEVICE=cuda
+#       - OLLAMA_BASE_URL=127.0.0.1:11434/
+#       - NVIDIA_VISIBLE_DEVICES=all
+#       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+#     runtime: nvidia
+#     depends_on:
+#       - redis
+#     restart: always
+#     deploy:
+#       resources:
+#         reservations:
+#           devices:
+#             - driver: nvidia
+#               count: 1
+#               capabilities: [gpu]
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+
+#   redis:
+#     image: redis:7-alpine
+#     command: >
+#       sh -c "echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf &&
+#              sysctl -p &&
+#              redis-server --requirepass redis123 --appendonly yes"
+#     ports:
+#       - "6382:6379"
+#     volumes:
+#       - redis-data:/data
+#     restart: always
+
+# volumes:
+#   redis-data:
+
+
+# updated on 09-12-2025
+version: "2.4"
+
+services:
+  # API service
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "2002:8000"
+    volumes:
+      - .:/app
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./cache:/app/cache
+      - ./models:/app/models
+      - ./temp:/app/temp
+    command: python -m src.api.app
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis123
+      - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - CUDA_VISIBLE_DEVICES=0
+      - USE_CUDA=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    depends_on:
+      - redis
+    restart: always
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Celery worker for video processing
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./cache:/app/cache
+      - ./models:/app/models
+      - ./temp:/app/temp
+    command:
+      - celery
+      - -A
+      - src.queue_system.celery_app
+      - worker
+      - --loglevel=info
+      - --queues=video_processing,celery
+      - --pool=solo
+      - --concurrency=1
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis123
+      - CELERY_BROKER_URL=redis://:redis123@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:redis123@redis:6379/0
+      - WASABI_ACCESS_KEY=${WASABI_ACCESS_KEY}
+      - WASABI_SECRET_KEY=${WASABI_SECRET_KEY}
+      - WASABI_ENDPOINT=https://s3.us-east-1.wasabisys.com
+      - S3_BUCKET_NAME=redeem-tv
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - USE_CUDA=1
+      - WHISPER_DEVICE=cuda
+      - OLLAMA_BASE_URL=127.0.0.1:11434/
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    depends_on:
+      - redis
+    restart: always
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Redis server
+  redis:
+    image: redis:7-alpine
+    command: >
+      sh -c "echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf &&
+             sysctl -p &&
+             redis-server --requirepass redis123 --appendonly yes"
+    ports:
+      - "6382:6379"
+    volumes:
+      - redis-data:/data
+    restart: always
+
+volumes:
+  redis-data:

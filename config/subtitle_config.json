@@ -1,0 +1,154 @@
+[
+  {
+    "id": "cinematic",
+    "name": "Cinematic",
+    "style": {
+      "font_family": "Impact, sans-serif",
+      "letter_spacing": "3px",
+      "text_transform": "uppercase",
+      "font_weight": 700,
+      "pronunciation_color": "#4361ee",
+      "default_color": "#ccc"
+    }
+  },
+  {
+    "id": "elegant",
+    "name": "Elegant",
+    "style": {
+      "font_family": "Baskerville, serif",
+      "font_weight": 600,
+      "letter_spacing": "1px",
+      "font_style": "italic",
+      "pronunciation_color": "#b33771",
+      "default_color": "#ccc"
+    }
+  },
+  {
+    "id": "tech",
+    "name": "Tech",
+    "style": {
+      "font_family": "Courier New, monospace",
+      "letter_spacing": "2px",
+      "font_weight": 700,
+      "pronunciation_color": "#00b4d8",
+      "default_color": "#16213e"
+    }
+  },
+  {
+    "id": "bold-impact",
+    "name": "Bold Impact",
+    "style": {
+      "font_family": "Black Ops One, display",
+      "letter_spacing": "1px",
+      "text_transform": "uppercase",
+      "pronunciation_color": "#e74c3c",
+      "default_color": "#2c3e50"
+    }
+  },
+  {
+    "id": "vintage",
+    "name": "Vintage",
+    "style": {
+      "font_family": "UnifrakturMaguntia, fantasy",
+      "letter_spacing": "2px",
+      "pronunciation_color": "#6c5ce7",
+      "default_color": "#2d3436"
+    }
+  },
+  {
+    "id": "modern",
+    "name": "Modern",
+    "style": {
+      "font_family": "Raleway, sans-serif",
+      "letter_spacing": "1px",
+      "font_weight": 300,
+      "pronunciation_color": "#3498db",
+      "default_color": "#1e272e"
+    }
+  },
+  {
+    "id": "clean",
+    "name": "Clean",
+    "style": {
+      "font_family": "Helvetica Neue, sans-serif",
+      "font_weight": 700,
+      "letter_spacing": "0.5px",
+      "pronunciation_color": "#27ae60",
+      "default_color": "#2d3436"
+    }
+  },
+  {
+    "id": "handwritten",
+    "name": "Handwritten",
+    "style": {
+      "font_family": "Gloria Hallelujah, cursive",
+      "letter_spacing": "1px",
+      "pronunciation_color": "#e67e22",
+      "default_color": "#2c3e50"
+    }
+  },
+  {
+    "id": "decorative",
+    "name": "Decorative",
+    "style": {
+      "font_family": "Lobster, fantasy",
+      "letter_spacing": "1px",
+      "pronunciation_color": "#e056fd",
+      "default_color": "#1e3799"
+    }
+  },
+  {
+    "id": "minimal",
+    "name": "Minimal",
+    "style": {
+      "font_family": "Futura, sans-serif",
+      "font_weight": 600,
+      "letter_spacing": "2px",
+      "text_transform": "uppercase",
+      "pronunciation_color": "#34495e",
+      "default_color": "#2c3e50"
+    }
+  },
+  {
+    "id": "gaming",
+    "name": "Gaming",
+    "style": {
+      "font_family": "Press Start 2P, fantasy",
+      "letter_spacing": "1px",
+      "pronunciation_color": "#6D214F",
+      "default_color": "#182C61"
+    }
+  },
+  {
+    "id": "caption",
+    "name": "Caption",
+    "style": {
+      "font_family": "Fira Code, monospace",
+      "font_weight": 500,
+      "letter_spacing": "0.5px",
+      "pronunciation_color": "#58B19F",
+      "default_color": "#2C3A47"
+    }
+  },
+  {
+    "id": "brush",
+    "name": "Brush",
+    "style": {
+      "font_family": "Satisfy, cursive",
+      "letter_spacing": "1px",
+      "pronunciation_color": "#6F1E51",
+      "default_color": "#1B1464"
+    }
+  },
+  {
+    "id": "premium",
+    "name": "Premium",
+    "style": {
+      "font_family": "Cinzel, serif",
+      "letter_spacing": "2px",
+      "text_transform": "uppercase",
+      "pronunciation_color": "#4834d4",
+      "default_color": "#130f40"
+    }
+  }
+]

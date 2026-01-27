@@ -1,0 +1,14 @@
+[Script Info]
+Title: Kinetic Captions
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,32,&H00FFFFFF&,&H0000FFFF&,&H00000000&,&HB2000000&,1,0,0,0,100,100,0,0,1,2,1,2,0,0,80,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.80,Default,,0,0,0,,{\k40}Hey {\k40}what's {\k30}up {\k70}everyone,
+Dialogue: 0,0:00:01.80,0:00:02.50,Default,,0,0,0,,{\k30}I'm {\k39}here
+Dialogue: 0,0:00:04.50,0:00:07.00,Default,,0,0,0,,{\k20}to {\k89}demonstrate {\k60}kinetic {\k79}captions
+Dialogue: 0,0:00:08.00,0:00:09.80,Default,,0,0,0,,{\k30}with {\k79}word-level {\k70}timing.

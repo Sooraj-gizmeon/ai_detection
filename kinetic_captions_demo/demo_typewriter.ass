@@ -1,0 +1,23 @@
+[Script Info]
+Title: Kinetic Captions
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,32,&H00FFFFFF&,&H0000FFFF&,&H00000000&,&HB2000000&,1,0,0,0,100,100,0,0,1,2,1,2,0,0,80,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.80,Default,,0,0,0,,Hey
+Dialogue: 0,0:00:00.40,0:00:01.80,Default,,0,0,0,,Hey what's
+Dialogue: 0,0:00:00.80,0:00:01.80,Default,,0,0,0,,Hey what's up
+Dialogue: 0,0:00:01.10,0:00:01.80,Default,,0,0,0,,Hey what's up everyone,
+Dialogue: 0,0:00:01.80,0:00:02.50,Default,,0,0,0,,I'm
+Dialogue: 0,0:00:02.10,0:00:02.50,Default,,0,0,0,,I'm here
+Dialogue: 0,0:00:04.50,0:00:07.00,Default,,0,0,0,,to
+Dialogue: 0,0:00:04.70,0:00:07.00,Default,,0,0,0,,to demonstrate
+Dialogue: 0,0:00:05.60,0:00:07.00,Default,,0,0,0,,to demonstrate kinetic
+Dialogue: 0,0:00:06.20,0:00:07.00,Default,,0,0,0,,to demonstrate kinetic captions
+Dialogue: 0,0:00:08.00,0:00:09.80,Default,,0,0,0,,with
+Dialogue: 0,0:00:08.30,0:00:09.80,Default,,0,0,0,,with word-level
+Dialogue: 0,0:00:09.10,0:00:09.80,Default,,0,0,0,,with word-level timing.

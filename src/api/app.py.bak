@@ -1,0 +1,379 @@
+"""
+FastAPI application for video processing API endpoints.
+Independent from the Celery worker state.
+"""
+
+import os
+import logging
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
+import uvicorn
+import redis
+import json
+from celery.result import AsyncResult
+from dotenv import load_dotenv
+
+# Import Celery app and tasks - only for task submission, not for worker state
+from src.queue_system.celery_app import celery_app
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Create FastAPI app
+app = FastAPI(
+    title="Video Processing API",
+    description="""
+    API for processing videos into shorts.
+    
+    ### Canvas Type vs. Content Aspect Ratio
+    
+    - **canvas_type**: Determines the output container dimensions
+      - `shorts`: 9:16 vertical video container
+      - `clips`: 16:9 horizontal video container
+    
+    - **aspect_ratio**: Determines the aspect ratio of the content within the canvas
+      - Example: `1:1` for square content within a vertical shorts container
+      - Example: `2.35:1` for cinematic content within a shorts container
+      - If not specified, defaults to match the canvas_type aspect ratio
+    """,
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Change this in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Redis client for task status tracking
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", "6379")),
+    db=int(os.getenv("REDIS_DB", "0")),
+    password=os.getenv("REDIS_PASSWORD", ""),
+    decode_responses=True  # Return strings instead of bytes
+)
+
+# Define models
+class VideoProcessingRequest(BaseModel):
+    """Model for video processing request."""
+    
+    video_id: str = Field(..., description="Unique identifier for the video job")
+    final_video_ids: List[str] = Field(default_factory=list, description="List of video IDs for the output videos")
+    canvas_type: str = Field(default="shorts", description="Canvas type: 'shorts' (9:16) or 'clips' (16:9)")
+    no_of_videos: int = Field(default=5, ge=1, le=20, description="Number of output videos to generate")
+    min_duration: int = Field(default=15, ge=5, le=300, description="Minimum duration of each output video in seconds")
+    max_duration: int = Field(default=60, ge=10, le=600, description="Maximum duration of each output video in seconds")
+    aspect_ratio: str = Field(default=None, description="Content aspect ratio within the canvas ('9:16', '16:9', '1:1', etc.)")
+    pubid: str = Field(..., description="Publisher ID")
+    bucket_path: str = Field(..., description="Path to the input video in the storage bucket")
+    storage_bucket: str = Field(default="videos", description="Name of the storage bucket")
+    
+    @validator('canvas_type')
+    def validate_canvas_type(cls, v):
+        """Validate canvas type."""
+        if v not in ['shorts', 'clips']:
+            raise ValueError("canvas_type must be 'shorts' or 'clips'")
+        return v
+    
+    @validator('aspect_ratio')
+    def validate_aspect_ratio(cls, v):
+        """Validate aspect ratio."""
+        # Allow None (will default based on canvas_type)
+        if v is None:
+            return v
+            
+        try:
+            width, height = v.split(':')
+            int(width), int(height)  # Check if they are integers
+        except (ValueError, TypeError):
+            raise ValueError("aspect_ratio must be in format 'width:height' (e.g., '9:16')")
+        return v
+        
+    def get_canvas_aspect_ratio_tuple(self) -> tuple:
+        """
+        Get canvas aspect ratio based on canvas_type.
+        
+        Returns:
+            Tuple of (width, height) for the canvas aspect ratio
+        """
+        # Canvas aspect ratio is always determined by canvas_type
+        return (9, 16) if self.canvas_type == 'shorts' else (16, 9)
+        
+    def get_content_aspect_ratio_tuple(self) -> tuple:
+        """
+        Convert aspect_ratio string to tuple, or default based on canvas_type.
+        
+        Returns:
+            Tuple of (width, height) for content aspect ratio
+        """
+        # Try aspect_ratio first
+        if self.aspect_ratio:
+            try:
+                width, height = self.aspect_ratio.split(':')
+                return (int(width), int(height))
+            except (ValueError, TypeError):
+                pass
+                
+        # Default to same as canvas aspect ratio
+        return self.get_canvas_aspect_ratio_tuple()
+
+class VideoProcessingResponse(BaseModel):
+    """Model for video processing response."""
+    
+    task_id: str = Field(..., description="Celery task ID")
+    video_id: str = Field(..., description="Video job ID")
+    status: str = Field(..., description="Task status")
+    message: str = Field(..., description="Response message")
+
+class TaskStatusResponse(BaseModel):
+    """Model for task status response."""
+    
+    task_id: str = Field(..., description="Celery task ID")
+    video_id: str = Field(None, description="Video job ID")
+    status: str = Field(..., description="Task status")
+    result: Optional[Dict] = Field(None, description="Task result if available")
+    error: Optional[str] = Field(None, description="Error message if failed")
+
+# Function to store task metadata in Redis
+def store_task_metadata(task_id: str, video_id: str, request_data: Dict[str, Any]):
+    """Store task metadata in Redis for independent tracking."""
+    try:
+        # Create metadata
+        metadata = {
+            "task_id": task_id,
+            "video_id": video_id,
+            "status": "PENDING",
+            "request_data": request_data,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Store in Redis with appropriate keys
+        redis_client.set(f"task:{task_id}", json.dumps(metadata))
+        redis_client.set(f"video:{video_id}", task_id)
+        redis_client.sadd("active_tasks", task_id)
+        
+        logger.info(f"Stored metadata for task {task_id} (video {video_id})")
+    except Exception as e:
+        logger.error(f"Failed to store task metadata: {e}")
+
+# API routes
+@app.post("/api/queue/video", response_model=VideoProcessingResponse)
+async def queue_video_processing(request: VideoProcessingRequest, background_tasks: BackgroundTasks):
+    """
+    Queue a video for processing.
+    
+    This endpoint accepts video processing parameters and adds the job to the Celery queue.
+    
+    The canvas_type determines the output container dimensions:
+    - shorts: 9:16 vertical video container
+    - clips: 16:9 horizontal video container
+    
+    The aspect_ratio determines how the content is framed within the canvas.
+    If not specified, aspect_ratio defaults to match the canvas_type.
+    """
+    try:
+        # Convert Pydantic model to dictionary
+        task_data = request.dict()
+        
+        # Calculate canvas aspect ratio based on canvas_type
+        canvas_aspect_ratio = request.get_canvas_aspect_ratio_tuple()
+        task_data['canvas_aspect_ratio_tuple'] = canvas_aspect_ratio
+        
+        # Calculate content aspect ratio based on aspect_ratio or default
+        content_aspect_ratio = request.get_content_aspect_ratio_tuple()
+        task_data['content_aspect_ratio_tuple'] = content_aspect_ratio
+        
+        logger.info(f"Processing video with canvas_type={request.canvas_type}, " +
+                   f"canvas_aspect_ratio={canvas_aspect_ratio}, " +
+                   f"content_aspect_ratio={content_aspect_ratio}")
+        
+        # Submit task to Celery queue
+        task = celery_app.send_task(
+            "process_video_task",
+            kwargs={"task_data": task_data},
+            queue="video_processing",
+            routing_key="video_processing"
+        )
+        
+        # Store metadata in Redis (in background to avoid blocking)
+        background_tasks.add_task(
+            store_task_metadata,
+            task.id,
+            request.video_id,
+            task_data
+        )
+        
+        return {
+            "task_id": task.id,
+            "video_id": request.video_id,
+            "status": "queued",
+            "message": f"Video processing task has been queued successfully with canvas_type={request.canvas_type} ({canvas_aspect_ratio}), " +
+                      f"content aspect_ratio={content_aspect_ratio}"
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to queue task: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to queue task: {str(e)}")
+
+@app.get("/api/queue/status/{task_id}", response_model=TaskStatusResponse)
+async def get_task_status(task_id: str):
+    """
+    Get the status of a task.
+    
+    This endpoint returns the status of a task by its ID using Redis for state tracking.
+    """
+    try:
+        # First check Redis for task metadata
+        task_data_str = redis_client.get(f"task:{task_id}")
+        
+        if not task_data_str:
+            # Task not found in Redis, try Celery directly as fallback
+            task_result = AsyncResult(task_id, app=celery_app)
+            
+            return {
+                "task_id": task_id,
+                "status": task_result.status,
+                "result": task_result.result if task_result.ready() and task_result.successful() else None,
+                "error": str(task_result.result) if task_result.ready() and not task_result.successful() else None
+            }
+        
+        # Parse task data from Redis
+        task_data = json.loads(task_data_str)
+        video_id = task_data.get("video_id")
+        
+        # Check if we have a result
+        result_data_str = redis_client.get(f"result:{task_id}")
+        result_data = json.loads(result_data_str) if result_data_str else None
+        
+        # Check Celery for the current status (we don't depend on the worker for results)
+        try:
+            task_result = AsyncResult(task_id, app=celery_app)
+            status = task_result.status
+        except:
+            # If Celery is unavailable, use the status from Redis
+            status = task_data.get("status", "UNKNOWN")
+        
+        return {
+            "task_id": task_id,
+            "video_id": video_id,
+            "status": status,
+            "result": result_data.get("result") if result_data else None,
+            "error": result_data.get("error") if result_data else None
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get task status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get task status: {str(e)}")
+
+@app.get("/api/queue/video/{video_id}", response_model=TaskStatusResponse)
+async def get_status_by_video_id(video_id: str):
+    """
+    Get the status of a task by video ID.
+    
+    This endpoint returns the status of a task using the video ID.
+    """
+    try:
+        # Get task ID from video ID
+        task_id = redis_client.get(f"video:{video_id}")
+        
+        if not task_id:
+            raise HTTPException(status_code=404, detail=f"No task found for video ID: {video_id}")
+        
+        # Reuse the task status endpoint
+        return await get_task_status(task_id)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get task by video ID: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get task by video ID: {str(e)}")
+
+@app.get("/api/queue/list")
+async def list_tasks():
+    """
+    List all active tasks.
+    
+    This endpoint returns a list of all active tasks using Redis for state tracking.
+    """
+    try:
+        # Get all active tasks from Redis
+        task_ids = redis_client.smembers("active_tasks")
+        
+        if not task_ids:
+            return {"tasks": []}
+        
+        tasks = []
+        for task_id in task_ids:
+            task_data_str = redis_client.get(f"task:{task_id}")
+            if task_data_str:
+                task_data = json.loads(task_data_str)
+                
+                # Check current status from Celery if available
+                try:
+                    task_result = AsyncResult(task_id, app=celery_app)
+                    status = task_result.status
+                except:
+                    # If Celery is unavailable, use the status from Redis
+                    status = task_data.get("status", "UNKNOWN")
+                
+                tasks.append({
+                    "task_id": task_id,
+                    "video_id": task_data.get("video_id"),
+                    "status": status,
+                    "created_at": task_data.get("created_at")
+                })
+        
+        return {"tasks": tasks}
+    
+    except Exception as e:
+        logger.error(f"Failed to list tasks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list tasks: {str(e)}")
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint."""
+    # Check Redis connection
+    redis_status = "ok"
+    try:
+        redis_client.ping()
+    except Exception as e:
+        logger.error(f"Redis health check failed: {e}")
+        redis_status = f"error: {str(e)}"
+    
+    # Check Celery connection (broker only)
+    celery_status = "ok"
+    try:
+        celery_app.control.ping(timeout=1.0)
+    except Exception as e:
+        logger.error(f"Celery broker health check failed: {e}")
+        celery_status = f"error: {str(e)}"
+    
+    return {
+        "status": "ok",
+        "service": "video-processing-api",
+        "components": {
+            "redis": redis_status,
+            "celery_broker": celery_status
+        }
+    }
+
+def start_api():
+    """Start the FastAPI server."""
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("API_PORT", "8000"))
+    
+    uvicorn.run("src.api.app:app", host=host, port=port, reload=True)
+
+if __name__ == "__main__":
+    start_api()
