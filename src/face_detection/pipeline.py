@@ -14,9 +14,8 @@ from .utils import (
     seconds_to_hhmmss,
 )
 
-from logging_utils import get_logger
-
-logger = get_logger(__name__)
+import logging
+logger = logging.getLogger('integrated_processor')
 
 
 def run_pipeline(

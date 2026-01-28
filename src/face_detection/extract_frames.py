@@ -3,9 +3,8 @@ import subprocess
 import argparse
 
 from .utils import get_video_codec, get_video_fps
-from logging_utils import get_logger
-
-logger = get_logger(__name__)
+import logging
+logger = logging.getLogger('integrated_processor')
 
 
 def extract_frames(input_video, output_dir, fps=1, use_gpu=True):

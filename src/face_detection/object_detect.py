@@ -1,9 +1,7 @@
 # object_detect.py
 from ultralytics import YOLO
 import logging
-from logging_utils import get_logger
-
-logger = get_logger(__name__)
+logger = logging.getLogger('integrated_processor')
 
 # object_model = YOLO("models/yolov8x.pt")
 #object_model = YOLO("models/yolov8n_100e.pt")

@@ -2,13 +2,12 @@ import os
 import json
 from datetime import timedelta
 import subprocess
-import logging
 import sys
 from functools import lru_cache
 
 
-from logging_utils import get_logger
-logger = get_logger(__name__)
+import logging
+logger = logging.getLogger('integrated_processor')
 
 
 def timestamp_from_frame(frame_number, fps):

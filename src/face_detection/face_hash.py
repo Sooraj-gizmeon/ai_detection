@@ -5,8 +5,9 @@ from PIL import Image
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
 from numpy.linalg import norm
+
 import logging
-from logging_utils import get_logger
+logger = logging.getLogger('integrated_processor')
 
 
 
@@ -14,8 +15,6 @@ RAW_DIR = "frames/raw"
 UNIQUE_DIR = "frames/unique"
 os.makedirs(UNIQUE_DIR, exist_ok=True)
 
-# Configure logger for the module
-logger = get_logger(__name__)
 
 model = YOLO("models/yolov8n_100e.pt")
 face_app = FaceAnalysis(name="buffalo_l")
@@ -43,13 +42,15 @@ def cosine_similarity(a, b):
 def detect_faces_yolo(img):
     results = model(img, device=0)[0]
     faces = []
+   
     for box in results.boxes:
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
         conf = float(box.conf)
         logger.info(f"YOLO detected box: ({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}), conf={conf:.3f}")
         if conf < 0.58:
             logger.info(f"Skipping box due to low confidence: {conf:.3f}")
-            continue
+            continue    
+      
         w, h = x2 - x1, y2 - y1
         if w < 80 or h < 80:
             logger.info(f"Skipping box due to small size: w={w}, h={h}")

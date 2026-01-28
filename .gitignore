@@ -16,6 +16,7 @@ output/*
 cache/*
 logs/*
 input/*
+frames/*
 
 # Models
 models/*

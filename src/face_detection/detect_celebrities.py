@@ -7,11 +7,10 @@ from PIL import Image
 UNIQUE_DIR = "frames/unique"
 
 # Configure logger for the module
-from logging_utils import get_logger
-logger = get_logger(__name__)
+# from logging_utils import get_logger
+# logger = get_logger(__name__)
 
-
-
+logger = logging.getLogger('integrated_processor')
 rek = boto3.client("rekognition")
 
 def recognize_frame(image_path):

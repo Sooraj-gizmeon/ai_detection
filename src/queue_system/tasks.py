@@ -406,8 +406,6 @@ def process_video_task(self, task_data: Dict) -> Dict:
                 )
                 logger.info(f"Local detection pipeline completed. Results saved to {celebrity_result_path}")
                 task_data["celebrity_result_path"] = celebrity_result_path
-                if "processor" in locals() and hasattr(processor, "config"):
-                    processor.config["celebrity_index_path"] = celebrity_result_path
                 # Reference image search (optional)
                 if reference_image_path:
                     from src.face_detection.reference_search import search_reference_image
@@ -491,7 +489,8 @@ def process_video_task(self, task_data: Dict) -> Dict:
                 'enable_object_detection': enable_object_detection,  # Pass object detection flag
                 'intro_url': intro_url,  # Pass intro URL for downstream processing
                 'outro_url': outro_url,   # Pass outro URL for downstream processing
-                'celebrity_index_path': celebrity_result_path# Optional precomputed celebrity JSON path
+                # Only set celebrity_index_path if celebrity_result_path was set above
+                'celebrity_index_path': celebrity_result_path if (celebrity_detection or object_detection) else None
             }
 
             # Update processor config with task-specific settings

@@ -9,9 +9,8 @@ from PIL import Image
 from numpy.linalg import norm
 from .object_detect import detect_objects
 
-from logging_utils import get_logger
-
-logger = get_logger(__name__)
+import logging
+logger = logging.getLogger('integrated_processor')
 
 # -------------------- Paths --------------------
 RAW_DIR = "frames/raw"
