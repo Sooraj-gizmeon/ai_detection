@@ -23,7 +23,8 @@ models/*
 models/whisper/base.pt
 models/yolov8n.pt
 yolov8n.pt
-
+yolov8m.pt
+yolov8l.pt
 # Build and distribution
 bin/*
 lib/*
