@@ -61,6 +61,12 @@ def setup_logging(level=logging.INFO, log_file=None, log_dir="logs"):
     # Log startup message
     logging.info(f"Logging initialized - Level: {logging.getLevelName(level)}")
     logging.info(f"Log file: {log_filepath}")
+   
+    # Configure 'integrated_processor' logger to ensure it gets logged to file
+    # This is used by face_detection modules
+    integrated_logger = logging.getLogger('integrated_processor')
+    integrated_logger.setLevel(level)
+    integrated_logger.propagate = True  # Ensure logs propagate to root logger
     
     return str(log_filepath)
 

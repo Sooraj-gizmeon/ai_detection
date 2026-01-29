@@ -72,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from main import VideoToShortsProcessor
 from dotenv import load_dotenv
+from utils import setup_logging
 
 # Load environment variables
 load_dotenv()
@@ -153,6 +154,9 @@ def process_video_task(self, task_data: Dict) -> Dict:
     Returns:
         Dictionary with processing results
     """
+    # Initialize logging for this task
+    setup_logging(level=logging.INFO)
+   
     logger.info(f"Starting video processing task: {task_data.get('video_id')}")
     
     try:
