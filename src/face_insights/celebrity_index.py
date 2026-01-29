@@ -9,6 +9,9 @@ def load_celebrity_index(path: str) -> Tuple[Dict[str, List[int]], Dict[str, flo
     Load result.json and build:
       - appearances_per_actor: actor -> sorted list of integer seconds where they appear
       - actor_conf: actor -> global confidence
+    
+    IMPORTANT: Same actor can be detected multiple times with different face_ids.
+    This function consolidates all appearances for the same actor name.
     """
     data = json.loads(Path(path).read_text())
     appearances_per_actor: Dict[str, List[int]] = {}
@@ -22,10 +25,56 @@ def load_celebrity_index(path: str) -> Tuple[Dict[str, List[int]], Dict[str, flo
         times = sorted(int(a["timestamp_sec"]) for a in celeb.get("appearances", []) if "timestamp_sec" in a)
         if not times:
             continue
-        appearances_per_actor[name] = times
-        actor_conf[name] = conf
+        
+        # Consolidate appearances for same actor (same actor detected with different face_ids)
+        if name not in appearances_per_actor:
+            appearances_per_actor[name] = []
+            actor_conf[name] = conf
+        
+        appearances_per_actor[name].extend(times)
+    
+    # Remove duplicates and sort for each actor
+    for actor in appearances_per_actor:
+        appearances_per_actor[actor] = sorted(set(appearances_per_actor[actor]))
 
     return appearances_per_actor, actor_conf
+
+
+def load_object_index(path: str) -> Tuple[Dict[str, List[Dict]], Dict[str, float], Dict[str, str]]:
+    """
+    Load result.json for object detection data.
+    Returns:
+      - appearances_per_object: object_id -> list of dicts with 'start_sec', 'end_sec', 'score'
+      - object_conf: object_id -> confidence score
+      - object_labels: object_id -> label/name
+    
+    This function handles object detection results similar to celebrity detection.
+    """
+    data = json.loads(Path(path).read_text())
+    appearances_per_object: Dict[str, List[Dict]] = {}
+    object_conf: Dict[str, float] = {}
+    object_labels: Dict[str, str] = {}
+
+    # If objects exist in the data, process them
+    for obj in data.get("objects", []):
+        obj_id = obj.get("id", obj.get("label", "unknown"))
+        label = obj.get("label", obj_id)
+        conf = float(obj.get("confidence", 1.0))
+        
+        if obj_id not in appearances_per_object:
+            appearances_per_object[obj_id] = []
+            object_conf[obj_id] = conf
+            object_labels[obj_id] = label
+        
+        # Process segments/appearances for this object
+        for segment in obj.get("segments", obj.get("appearances", [])):
+            appearances_per_object[obj_id].append({
+                "start_sec": float(segment.get("start_sec", 0)),
+                "end_sec": float(segment.get("end_sec", 0)),
+                "score": float(segment.get("score", conf)),
+            })
+
+    return appearances_per_object, object_conf, object_labels
 
 
 def actor_coverage_for_segment(

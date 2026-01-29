@@ -274,10 +274,8 @@ class ContentAnalyzer:
                 
                 self.logger.info(f"Object detection completed: {object_detection_results.get('total_detections', 0)} objects detected")
             
-            # Step 2: Generate ALL possible candidate segments
-            self.logger.info("Generating comprehensive candidate segments...")
-
-            # Decide whether prompt explicitly requests actor-only clips
+            # Step 2: Generate ALL possible candidate segments (or skip if actor-only)
+            # OPTIMIZATION: Detect actor-only requests early to skip expensive candidate generation
             actor_only = False
             if celebrity_index_path and user_prompt:
                 try:
@@ -288,19 +286,26 @@ class ContentAnalyzer:
                             actor_only = True
                             break
                     if actor_only:
-                        self.logger.info("Detected actor-only request from prompt; generating actor-only candidates")
+                        self.logger.info(f"🎯 DETECTED ACTOR-ONLY REQUEST - will skip comprehensive candidate generation and extract directly from precomputed timestamps")
                 except Exception as e:
                     self.logger.warning(f"Could not inspect celebrity index for actor-only detection: {e}")
 
-            all_candidates = self.segment_generator.generate_all_possible_segments(
-                video_info=video_info,
-                audio_analysis=audio_analysis,
-                scene_analysis=scene_analysis,
-                target_duration=target_duration,
-                max_total_segments=300,  # Increased for comprehensive analysis
-                celebrity_index_path=celebrity_index_path,
-                actor_only=actor_only
-            )
+            # CRITICAL OPTIMIZATION: For actor-only requests, skip expensive candidate segment generation
+            # The prompt analyzer will extract segments directly from precomputed actor timestamps
+            if actor_only:
+                self.logger.info("⚡ ACTOR-ONLY MODE: Skipping comprehensive candidate generation for efficiency")
+                all_candidates = []  # Empty list - prompt_analyzer will generate segments from precomputed timestamps
+            else:
+                self.logger.info("Generating comprehensive candidate segments...")
+                all_candidates = self.segment_generator.generate_all_possible_segments(
+                    video_info=video_info,
+                    audio_analysis=audio_analysis,
+                    scene_analysis=scene_analysis,
+                    target_duration=target_duration,
+                    max_total_segments=300,  # Increased for comprehensive analysis
+                    celebrity_index_path=celebrity_index_path,
+                    actor_only=actor_only
+                )
             
             # DETAILED DEBUG: Log candidate generation results
             self.logger.info(f"🔍 CANDIDATE SEGMENT GENERATION DEBUG:")
@@ -426,6 +431,24 @@ class ContentAnalyzer:
                         self.logger.info(f"Added object reference segment: {seg.get('start_time', 0)}-{seg.get('end_time', 0)}s")
                 
                 self.logger.info(f"Found {len(prompt_segments)} prompt-matched segments")
+                
+                # Log segment details with actor verification info
+                if prompt_segments and len(prompt_segments) > 0:
+                    actor_info = ""
+                    if prompt_segments[0].get('actor_focus'):
+                        actor_info = f" (Actor: {prompt_segments[0].get('actor_focus')})"
+                    
+                    self.logger.info(f"📊 Prompt-matched segment coverage{actor_info}:")
+                    for i, seg in enumerate(prompt_segments[:10]):  # Log first 10
+                        appearance_ts = seg.get('appearance_timestamp_sec', 'N/A')
+                        start = seg.get('start_time', 'N/A')
+                        end = seg.get('end_time', 'N/A')
+                        source = seg.get('source', 'unknown')
+                        self.logger.info(
+                            f"  [{i+1}] {start:.1f}s-{end:.1f}s (appearance at {appearance_ts}s, source: {source})"
+                        )
+                    if len(prompt_segments) > 10:
+                        self.logger.info(f"  ... and {len(prompt_segments) - 10} more segments")
                 
                 # Phase 2: Multi-pass analysis pipeline (if available)
                 if self.ollama_client and content_overview and intent_analysis and len(prompt_segments) > 0:

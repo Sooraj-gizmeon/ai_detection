@@ -289,39 +289,66 @@ class PromptBasedAnalyzer:
                 actor_matches = self._detect_actor_from_prompt(user_prompt, appearances_per_actor)
 
             if actor_matches:
-                # Interpret "all clips with X" intent (simple heuristics)
-                want_all = any(word in user_prompt.lower() for word in ['all', 'every', 'every clip', 'every clip with', 'all clips', 'clips with'])
-
-                selected = []
-                for seg in candidate_segments:
-                    per_actor = actor_coverage_for_segment(seg['start_time'], seg['end_time'], appearances_per_actor, actor_conf)
-                    score = compute_celebrity_score(per_actor)
-                    seg_copy = seg.copy()
-                    seg_copy['celebrity_score'] = score
-                    seg_copy['celebrity_actors'] = per_actor
-                    # Ensure actor-matched segments get a baseline prompt_match_score so they survive quality filtering
-                    if want_all:
-                        # keep even low coverage, give small baseline
-                        seg_copy['prompt_match_score'] = max(seg_copy.get('prompt_match_score', 0.0), score, 0.05)
-                        if score > 0.01:
-                            selected.append(seg_copy)
+                # STRICT IMPLEMENTATION: Use ONLY precomputed actor timestamps
+                # Do NOT recompute confidence scores, do NOT use candidate segments
+                # Do NOT fall back to random segment generation
+                
+                self.logger.info(
+                    f"🎯 STRICT ACTOR MODE: Extracting segments ONLY from precomputed "
+                    f"'{actor_matches}' timestamps (user_prompt: '{user_prompt}')"
+                )
+                
+                try:
+                    from .actor_segment_extractor import ActorSegmentExtractor
+                    extractor = ActorSegmentExtractor()
+                    
+                    # Get video duration from video_info
+                    video_duration = video_info.get('duration', 3600) if video_info else 3600
+                    
+                    # Extract segments exclusively from precomputed actor appearances
+                    selected = extractor.extract_multiple_actors_segments(
+                        actor_matches,
+                        appearances_per_actor,
+                        actor_conf,
+                        min_duration=60,  # Default minimum
+                        max_duration=120,  # Default maximum
+                        video_start=0.0,
+                        video_end=video_duration
+                    )
+                    
+                    if selected:
+                        # Log actor timestamps for verification
+                        for actor in actor_matches:
+                            actor_timestamps = appearances_per_actor.get(actor, [])
+                            if actor_timestamps:
+                                timestamps_str = ", ".join([f"{int(t)}s" for t in sorted(set(actor_timestamps))])
+                                self.logger.info(
+                                    f"✓ Actor '{actor}' appears at: [{timestamps_str}]"
+                                )
+                        
+                        self.logger.info(
+                            f"✅ Generated {len(selected)} segments from precomputed actor timestamps "
+                            f"(NO fallback to candidate segments, NO recomputed scores)"
+                        )
+                        
+                        return {
+                            'status': 'success',
+                            'analysis_method': 'actor_only_strict',
+                            'user_prompt': user_prompt,
+                            'matched_actors': actor_matches,
+                            'segments': selected,
+                            'celebrity_index_path': celebrity_index_path,
+                            'actor_appearances': {actor: sorted(set(appearances_per_actor.get(actor, []))) for actor in actor_matches},
+                            'generation_note': 'Segments extracted exclusively from precomputed actor detection timestamps. Confidence scores from precomputed results. NO recomputation.'
+                        }
                     else:
-                        # Stronger baseline for explicit actor requests
-                        seg_copy['prompt_match_score'] = max(seg_copy.get('prompt_match_score', 0.0), score, 0.25)
-                        if score > 0:
-                            selected.append(seg_copy)
-
-                # If we found some matching segments, return them prioritized by celebrity_score
-                if selected:
-                    selected.sort(key=lambda x: x.get('celebrity_score', 0), reverse=True)
-                    return {
-                        'status': 'success',
-                        'analysis_method': 'celebrity_direct_match',
-                        'user_prompt': user_prompt,
-                        'matched_actors': actor_matches,
-                        'segments': selected,
-                        'celebrity_index_path': celebrity_index_path
-                    }
+                        self.logger.warning(
+                            f"No segments generated from precomputed actor timestamps for: {actor_matches}"
+                        )
+                        
+                except Exception as e:
+                    self.logger.error(f"Error in actor-only segment extraction: {e}", exc_info=True)
+                    # Fall through to other analysis methods below
 
             # Check for object-based requests
             object_matches = []

@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/root/celebrity-face-detection/test_deduplication.py", line 12, in <module>
+    from content_analysis.actor_segment_extractor import ActorSegmentExtractor
+  File "/root/celebrity-face-detection/src/content_analysis/__init__.py", line 4, in <module>
+    from .content_analyzer import ContentAnalyzer
+  File "/root/celebrity-face-detection/src/content_analysis/content_analyzer.py", line 10, in <module>
+    from .prompt_based_analyzer import PromptBasedAnalyzer
+  File "/root/celebrity-face-detection/src/content_analysis/prompt_based_analyzer.py", line 9, in <module>
+    from ..ai_integration.llm_provider import create_llm_provider, ManagedLLMProvider
+ImportError: attempted relative import beyond top-level package
