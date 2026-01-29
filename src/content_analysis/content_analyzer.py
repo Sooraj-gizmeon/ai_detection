@@ -837,41 +837,52 @@ class ContentAnalyzer:
         # Ensure segments have a usable prompt_match_score (derive from contextual/heuristic scores when absent)
         prompt_segments = self._ensure_prompt_scores(prompt_segments)
         
+        # CRITICAL: Check for object reference segments FIRST
+        # These are segments marked by the segment generator as having reference_match.score
+        object_reference_segments = [seg for seg in prompt_segments if seg.get('is_object_reference_segment', False)]
+        
+        if not object_reference_segments:
+            # Fallback: check for segments with has_object and object_score
+            object_reference_segments = [seg for seg in prompt_segments if seg.get('has_object') and seg.get('object_score', 0) > 0]
+        
+        if object_reference_segments:
+            self.logger.info(f"🎯 Found {len(object_reference_segments)} object reference segments - will use EXCLUSIVELY")
+        
+        # CRITICAL: Check for object reference segments FIRST
+        # These are segments marked by the segment generator as having reference_match.score
+        object_reference_segments = [seg for seg in prompt_segments if seg.get('is_object_reference_segment', False)]
+        
+        if not object_reference_segments:
+            # Fallback: check for segments with has_object and object_score
+            object_reference_segments = [seg for seg in prompt_segments if seg.get('has_object') and seg.get('object_score', 0) > 0]
+        
+        if object_reference_segments:
+            self.logger.info(f"🎯 Found {len(object_reference_segments)} object reference segments - will use EXCLUSIVELY")
+        
         # Sort by combined score (prompt match + object relevance)
         sorted_segments = sorted(prompt_segments, 
                                key=lambda x: self._calculate_combined_score(x), 
                                reverse=True)
         
-        # Special handling for object reference segments: include all with reference_match
-        object_reference_segments = [seg for seg in sorted_segments if seg.get('has_object') and seg.get('object_score', 0) > 0]
-        if object_reference_segments:
-            self.logger.info(f"Found {len(object_reference_segments)} segments with reference-matched objects, prioritizing them")
-            # Add them to the front
-            non_object_segments = [seg for seg in sorted_segments if not (seg.get('has_object') and seg.get('object_score', 0) > 0)]
-            sorted_segments = object_reference_segments + non_object_segments
-        
-        # Apply quality filtering
+        # Apply quality filtering - SPECIAL HANDLING FOR OBJECT REFERENCE SEGMENTS
         min_quality_threshold = 0.05
-        if actor_matches:
+        
+        # CRITICAL: If we have object reference segments, use ONLY those - bypass all other filtering
+        if object_reference_segments:
+            self.logger.info(f"🎯 OBJECT REFERENCE MODE: Using ONLY {len(object_reference_segments)} object reference segments")
+            # Sort object reference segments by start_time for consistency
+            quality_filtered = sorted(object_reference_segments, key=lambda x: x.get('start_time', 0))
+        elif actor_matches:
             # When user explicitly requested actor(s), prefer segments with celebrity coverage
             quality_filtered = [seg for seg in sorted_segments if seg.get('has_celebrity')]
             if not quality_filtered:
                 # Fallback to low threshold if no celeb-overlapping segments are available
                 quality_filtered = [seg for seg in sorted_segments if seg.get('prompt_match_score', 0) >= 0.01]
-        elif object_reference_segments:
-            # For object reference segments, include all of them
-            quality_filtered = object_reference_segments
         else:
             quality_filtered = [
                 seg for seg in sorted_segments 
                 if seg.get('prompt_match_score', 0) >= min_quality_threshold
             ]
-        
-        # Always include object reference segments if they exist (even if prompt doesn't match well)
-        if object_reference_segments:
-            for seg in object_reference_segments:
-                if seg not in quality_filtered:
-                    quality_filtered.append(seg)
         
         # Log segment scores for debugging
         if sorted_segments:
@@ -889,36 +900,44 @@ class ContentAnalyzer:
             self.logger.info(f"Lowered threshold to {min_quality_threshold}, now have {len(quality_filtered)} segments")
         
         # Apply diversity filtering (avoid temporal clustering)
-        final_segments = []
-        used_time_ranges = []
-        min_gap = 15.0  # Minimum 25 seconds between segments
-        
-        for segment in quality_filtered:
-            if len(final_segments) >= max_shorts:
-                break
+        # EXCEPTION: Skip diversity filtering for object reference segments - use them all
+        if object_reference_segments and quality_filtered == object_reference_segments:
+            # For object reference segments, use all of them up to max_shorts
+            final_segments = quality_filtered[:max_shorts]
+            self.logger.info(f"🎯 Object reference mode: using all {len(final_segments)} reference segments without diversity filtering")
+        else:
+            # Standard diversity filtering for other segment types
+            final_segments = []
+            used_time_ranges = []
+            min_gap = 15.0  # Minimum 15 seconds between segments
             
-            start_time = segment['start_time']
-            end_time = segment['end_time']
-            
-            # Check for temporal conflicts
-            conflict = False
-            for used_start, used_end in used_time_ranges:
-                # Check if segments are too close
-                gap_start = min(abs(start_time - used_end), abs(end_time - used_start))
-                gap_end = min(abs(end_time - used_start), abs(start_time - used_end))
+            for segment in quality_filtered:
+                if len(final_segments) >= max_shorts:
+                    break
                 
-                if gap_start < min_gap or gap_end < min_gap:
-                    # Check for actual overlap
-                    if not (end_time <= used_start or start_time >= used_end):
-                        conflict = True
-                        break
-            
-            if not conflict:
-                final_segments.append(segment)
-                used_time_ranges.append((start_time, end_time))
+                start_time = segment['start_time']
+                end_time = segment['end_time']
+                
+                # Check for temporal conflicts
+                conflict = False
+                for used_start, used_end in used_time_ranges:
+                    # Check if segments are too close
+                    gap_start = min(abs(start_time - used_end), abs(end_time - used_start))
+                    gap_end = min(abs(end_time - used_start), abs(start_time - used_end))
+                    
+                    if gap_start < min_gap or gap_end < min_gap:
+                        # Check for actual overlap
+                        if not (end_time <= used_start or start_time >= used_end):
+                            conflict = True
+                            break
+                
+                if not conflict:
+                    final_segments.append(segment)
+                    used_time_ranges.append((start_time, end_time))
         
         # If we don't have enough segments, add more with relaxed gap requirements
-        if len(final_segments) < max_shorts // 2:
+        # EXCEPTION: Skip this for object reference segments - they're already all included
+        if len(final_segments) < max_shorts // 2 and not (object_reference_segments and quality_filtered == object_reference_segments):
             relaxed_gap = min_gap / 2
             
             for segment in quality_filtered:

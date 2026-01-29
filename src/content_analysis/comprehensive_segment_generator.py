@@ -102,6 +102,7 @@ class ComprehensiveSegmentGenerator:
                     appearances_per_object = {}
                     object_conf = {}
                     object_labels = {}
+                    max_object_end = 0.0  # Track the latest object timestamp
                     for obj in raw.get('objects', []):
                         object_id = obj.get('object_id')
                         label = obj.get('label')
@@ -120,6 +121,8 @@ class ComprehensiveSegmentGenerator:
                                     'end_sec': float(end_sec),
                                     'score': score
                                 })
+                                # Track the latest object time to extend analysis range
+                                max_object_end = max(max_object_end, float(end_sec))
                         
                         if segments:
                             appearances_per_object[object_id] = segments
@@ -127,6 +130,22 @@ class ComprehensiveSegmentGenerator:
                             max_score = max(seg['score'] for seg in segments)
                             object_conf[object_id] = max_score
                             object_labels[object_id] = label
+                            self.logger.info(f"🎯 Loaded object {object_id} ({label}): {len(segments)} segments with max_score={max_score:.3f}")
+                    
+                    # CRITICAL FIX: If we have object reference segments, extend effective_end to include them
+                    if max_object_end > 0:
+                        # Extend effective_end to be at least 20s after the latest object (to have context)
+                        # IMPORTANT: Do NOT cap to video_duration - trust the object timestamps from result JSON
+                        adjusted_end = max_object_end + 50.0
+                        # Only cap to video_duration if adjusted_end would exceed it significantly
+                        # This allows objects near the end of the video to be included
+                        if adjusted_end > video_duration:
+                            adjusted_end = video_duration - 2.0  # Leave at least 2s margin
+                        if adjusted_end > effective_end:
+                            self.logger.info(f"🎯 EXTENDING ANALYSIS RANGE for object segments: {effective_end:.1f}s → {adjusted_end:.1f}s (last object at {max_object_end:.1f}s, video_duration={video_duration:.1f}s)")
+                            effective_end = adjusted_end
+                        else:
+                            self.logger.info(f"🎯 Object end ({max_object_end:.1f}s) already within range {effective_start:.1f}s-{effective_end:.1f}s")
 
                     actor_segments = self._generate_actor_based_segments(
                         appearances_per_actor,
@@ -172,10 +191,19 @@ class ComprehensiveSegmentGenerator:
                             s.setdefault('has_object', True)
                             s.setdefault('object_score', s.get('object_score', 1.0))
                             s.setdefault('object_focus', s.get('object_focus'))
-                            s.setdefault('prompt_match_score', max(0.6, s.get('prompt_match_score', 0.6)))
+                            # HIGH SCORE FOR OBJECT REFERENCE SEGMENTS - ensure they pass all filters
+                            s.setdefault('prompt_match_score', 0.95)
+                            # CRITICAL FLAG: Mark as object reference segment for downstream processing
+                            s['is_object_reference_segment'] = True
 
                         all_segments.extend(object_segments)
                         self.logger.info(f"Generated {len(object_segments)} object-based segments from celebrity index")
+                        
+                        # CRITICAL: If we have object reference segments, return them immediately without further analysis
+                        if object_segments:
+                            self.logger.info(f"🎯 OBJECT-REFERENCE MODE: Returning {len(object_segments)} object segments directly")
+                            unique = self._deduplicate_comprehensive_segments(object_segments, max_total_segments)
+                            return self._enhance_segments_with_metadata(unique, audio_analysis, scene_analysis)
                         
                 except Exception as e:
                     self.logger.warning(f"Could not generate actor/object-based segments: {e}")
@@ -584,6 +612,7 @@ class ComprehensiveSegmentGenerator:
         """Generate segments centered on object appearance segments.
         Uses object scores from reference_match to prioritize segments.
         """
+        self.logger.info(f"🎯 GENERATING OBJECT SEGMENTS: {len(appearances_per_object)} objects to process")
         segments = []
         try:
             try:
@@ -595,6 +624,7 @@ class ComprehensiveSegmentGenerator:
             compute_object_score = None
 
         for object_id, object_segments in appearances_per_object.items():
+            self.logger.info(f"🎯 Processing object {object_id}: {len(object_segments)} segments")
             for obj_seg in object_segments:
                 obj_start = obj_seg['start_sec']
                 obj_end = obj_seg['end_sec']
@@ -634,6 +664,8 @@ class ComprehensiveSegmentGenerator:
                 # Baseline prompt match to ensure survive downstream filtering
                 seg['prompt_match_score'] = seg.get('prompt_match_score', 0.9)
                 segments.append(seg)
+                self.logger.info(f"🎯 Added object segment: {object_id} @ {start:.1f}-{end:.1f}s (object @ {obj_start}-{obj_end}s)")
+
 
                 # Secondary longer option if object segment is long enough
                 obj_duration = obj_end - obj_start
@@ -662,6 +694,7 @@ class ComprehensiveSegmentGenerator:
                                 seg2['top_object'] = seg2['object_details'][0][0] if seg2.get('object_details') else None
                         seg2['prompt_match_score'] = seg2.get('prompt_match_score', 0.8)
                         segments.append(seg2)
+        self.logger.info(f"🎯 GENERATED {len(segments)} total object segments")
         return segments
 
     def _generate_quality_driven_segments(self,
