@@ -219,6 +219,7 @@ class PromptBasedAnalyzer:
                                 object_detection_results: Optional[Dict] = None,
                                 content_overview: Optional[Dict] = None,
                                 intent_analysis: Optional[Dict] = None,
+                                target_duration: Tuple[int, int] = (15, 60),
                                 llm_provider: str = "ollama") -> Dict:
         """
         Analyze video content based on user prompt to find matching segments.
@@ -234,6 +235,7 @@ class PromptBasedAnalyzer:
             object_detection_results: Object detection results (optional)
             content_overview: Content overview analysis (optional)
             intent_analysis: User intent analysis (optional)
+                        target_duration: Target duration range (min, max) in seconds
             llm_provider: LLM provider to use ('openai' or 'ollama')
             
         Returns:
@@ -310,8 +312,8 @@ class PromptBasedAnalyzer:
                         actor_matches,
                         appearances_per_actor,
                         actor_conf,
-                        min_duration=60,  # Default minimum
-                        max_duration=120,  # Default maximum
+                        min_duration=target_duration[0],
+                        max_duration=target_duration[1],
                         video_start=0.0,
                         video_end=video_duration
                     )

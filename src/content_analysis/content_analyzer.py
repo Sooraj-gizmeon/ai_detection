@@ -355,6 +355,7 @@ class ContentAnalyzer:
                 object_detection_results=object_detection_results,
                 content_overview=content_overview,  # ENHANCED: Pass content overview
                 intent_analysis=intent_analysis,    # ENHANCED: Pass intent analysis
+                target_duration=target_duration,
                 llm_provider=llm_provider
             )
             # Debug raw prompt_results
@@ -463,8 +464,8 @@ class ContentAnalyzer:
                         scene_analysis=scene_analysis,
                         content_overview=content_overview,
                         intent_analysis=intent_analysis,
-                        video_info=video_info,
                         target_duration=target_duration,
+                        video_info=video_info,
                         max_shorts=max_shorts
                     )
                     
